@@ -21,3 +21,4 @@ publishTo := {
 }
 
 publishMavenStyle := true
+sbtPluginPublishLegacyMavenStyle := false
