@@ -29,27 +29,43 @@ import com.azure.core.credential.TokenRequestContext
 import com.azure.identity.DefaultAzureCredentialBuilder
 
 object AzureDevOpsCredentialsPlugin extends AutoPlugin {
+  override def requires = MavenSettingsCredentialsPlugin
   override def trigger = allRequirements
 
   override lazy val projectSettings = Seq(
-    credentials ++= buildCredentials(resolvers.value, streams.value.log),
+    credentials ++= buildCredentials(credentials.value, resolvers.value, streams.value.log),
+
+    // Fix for https://github.com/coursier/coursier/issues/1649
     csrConfiguration := updateCoursierConf(
         csrConfiguration.value, csrResolvers.value, credentials.value),
     updateClassifiers / csrConfiguration :=
         csrConfiguration.value.withClassifiers(Vector("sources")).withHasClassifiers(true)
   )
 
-  private def buildCredentials(resolvers: Seq[Resolver], log: ManagedLogger): Seq[Credentials] = {
+  private def buildCredentials(
+      existingCredentials: Seq[Credentials],
+      resolvers: Seq[Resolver],
+      log: ManagedLogger): Seq[Credentials] = {
+    val credMap = existingCredentials.collect {
+      case credential: DirectCredentials =>
+        (credential.host, credential.userName) -> credential
+    }.toMap
     val helper = new AzureDevOpsCredentialHelper(log)
     resolvers.collect {
       case repo: MavenRepo =>
         val uri = new URI(repo.root)
-        for {
-          org <- getOrganization(uri)
-          realm <- helper.getRealm(uri)
-          token <- helper.token
-        } yield {
-          Credentials(realm, uri.getHost, org, token)
+        val host = uri.getHost
+        getOrganization(uri).flatMap { org =>
+          if (!credMap.contains((host, org))) {
+            for {
+              realm <- helper.getRealm(uri)
+              token <- helper.token
+            } yield {
+              Credentials(realm, host, org, token)
+            }
+          } else {
+            None
+          }
         }
     }.flatten
   }
@@ -89,6 +105,7 @@ object AzureDevOpsCredentialsPlugin extends AutoPlugin {
     }
 
     lazy val token: Option[String] = {
+      log.info("Trying to get access token")
       val credential = new DefaultAzureCredentialBuilder().build()
       // Restrict token to Azure DevOps
       val request = new TokenRequestContext().addScopes("499b84ac-1321-427f-aa17-267ca6975798")
@@ -121,9 +138,10 @@ object AzureDevOpsCredentialsPlugin extends AutoPlugin {
     val auths = resolvers.collect {
       case repo: MavenRepo =>
         val uri = new URI(repo.root)
+        val host = uri.getHost
         for {
           org <- getOrganization(uri)
-          credential <- credMap.get((uri.getHost, org))
+          credential <- credMap.get((host, org))
         } yield {
           repo.name -> Authentication(credential.userName, credential.passwd)
         }
