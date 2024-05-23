@@ -1,19 +1,20 @@
 # How to use
 
 Requirements:
-- SBT 1.3.0 or higher.
+- SBT 1.9.0 or higher.
 - Azure CLI
 
-Add the following line to `project/plugins.sbt`:
+Add the following lines to `project/plugins.sbt`:
 
 ```scala
-addSbtPlugin("dev.chungmin" % "sbt-azure-devops-credentials" % "0.0.1-SNAPSHOT")
+addSbtPlugin("dev.chungmin" % "sbt-maven-settings-credentials" % "0.0.2")
+addSbtPlugin("dev.chungmin" % "sbt-azure-devops-credentials" % "0.0.1")
 ```
 
 You should log in to Azure by using `az login`. Once you're logged in, the plugin will
 create access tokens for the Maven feeds from Azure DevOps.
 
-This plugin uses another SBT plugin, `sbt-maven-settings-credentials` to first check if the credentials are
+This plugin uses another SBT plugin `sbt-maven-settings-credentials` to first check if the credentials are
 already in `~/.m2/settings.xml`. If credentials are found in the Maven settings file, token creation can be skipped.
 
 # Example
