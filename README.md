@@ -1,8 +1,7 @@
 # How to use
 
 Requirements:
-- SBT 1.9.9 or higher.
-- Azure CLI
+- SBT 1.3.0 or higher.
 
 Add the following line to `project/plugins.sbt`:
 
@@ -22,10 +21,3 @@ resolvers += "InternalMaven" at "https://myorg.pkgs.visualstudio.com/myproject/_
 ```
 
 You can run `sbt 'show credentials'` to check if the credentials are populated correctly.
-
-# Known limitations
-
-- The realm value might be parsed incorrectly if it contains escape sequences.
-- It requires SBT 1.9.9 or higher.
-
-None of these are too difficult to fix, but the current code just works for me so I didn't bother to invest more time. Contributions are welcome.

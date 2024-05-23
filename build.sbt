@@ -4,7 +4,7 @@ name := "sbt-azure-devops-credentials"
 enablePlugins(SbtPlugin)
 pluginCrossBuild / sbtVersion := {
   scalaBinaryVersion.value match {
-    case "2.12" => "1.9.9"
+    case "2.12" => "1.3.0"
   }
 }
 
