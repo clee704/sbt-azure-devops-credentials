@@ -22,6 +22,9 @@ import sbt._
 import sbt.internal.util.ManagedLogger
 import Keys._
 
+import lmcoursier.CoursierConfiguration
+import lmcoursier.definitions.Authentication
+
 import com.azure.core.credential.TokenRequestContext
 import com.azure.identity.DefaultAzureCredentialBuilder
 
@@ -29,52 +32,54 @@ object AzureDevOpsCredentialsPlugin extends AutoPlugin {
   override def trigger = allRequirements
 
   override lazy val projectSettings = Seq(
-    credentials ++= buildCredentials(resolvers.value, streams.value.log)
+    credentials ++= buildCredentials(resolvers.value, streams.value.log),
+    csrConfiguration := updateCoursierConf(
+        csrConfiguration.value, csrResolvers.value, credentials.value),
+    updateClassifiers / csrConfiguration :=
+        csrConfiguration.value.withClassifiers(Vector("sources")).withHasClassifiers(true)
   )
 
   private def buildCredentials(resolvers: Seq[Resolver], log: ManagedLogger): Seq[Credentials] = {
     val helper = new AzureDevOpsCredentialHelper(log)
-    resolvers.map {
-      case resolver: MavenRepo =>
-        val uri = new URI(resolver.root)
-        helper.getOrganization(uri).flatMap { org =>
-          helper.getRealm(uri).flatMap { realm =>
-            helper.token.map { token =>
-              Credentials(realm, uri.getHost, org, token)
-            }
-          }
+    resolvers.collect {
+      case repo: MavenRepo =>
+        val uri = new URI(repo.root)
+        for {
+          org <- getOrganization(uri)
+          realm <- helper.getRealm(uri)
+          token <- helper.token
+        } yield {
+          Credentials(realm, uri.getHost, org, token)
         }
-      case _ => None
     }.flatten
   }
 
-  class AzureDevOpsCredentialHelper(log: ManagedLogger) {
-    def getOrganization(uri: URI): Option[String] = {
-      val host = uri.getHost
-      if (host.endsWith("pkgs.visualstudio.com")) {
-        Some(host.split("\\.").head)
-      } else if (host == "pkgs.dev.azure.com") {
-        val pathFragments = uri.getPath.split("/")
-        if (pathFragments.size > 0) {
-          Some(pathFragments.head)
-        } else {
-          None
-        }
+  private def getOrganization(uri: URI): Option[String] = {
+    val host = uri.getHost
+    if (host.endsWith("pkgs.visualstudio.com")) {
+      Some(host.split("\\.").head)
+    } else if (host == "pkgs.dev.azure.com") {
+      val pathFragments = uri.getPath.split("/")
+      if (pathFragments.size > 0) {
+        Some(pathFragments.head)
       } else {
         None
       }
+    } else {
+      None
     }
+  }
 
+  class AzureDevOpsCredentialHelper(log: ManagedLogger) {
     def getRealm(uri: URI): Option[String] = {
       try {
         val conn = uri.toURL.openConnection()
-        conn.getHeaderFields.asScala.get("WWW-Authenticate").flatMap { values =>
-          values.asScala.find(_.startsWith("Basic realm=")).flatMap { value =>
-            // TODO proper parsing
-            "Basic realm=\"([^\"]*)\"".r.findFirstMatchIn(value).map { m =>
-              m.group(1)
-            }
-          }
+        for {
+          values <- conn.getHeaderFields.asScala.get("WWW-Authenticate")
+          value <- values.asScala.find(_.startsWith("Basic realm="))
+          m <- "Basic realm=\"([^\"]*)\"".r.findFirstMatchIn(value)
+        } yield {
+          m.group(1)
         }
       } catch {
         case NonFatal(e) =>
@@ -93,14 +98,39 @@ object AzureDevOpsCredentialsPlugin extends AutoPlugin {
           log.info("Azure access token created")
           Some(token.getToken())
         } else {
-          log.warn(s"Failed to get access token")
+          log.warn(s"Failed to get access token (getToken() returned null)")
           None
         }
       } catch {
         case NonFatal(e) =>
-          log.warn(s"Failed to get access token: $e")
+          log.warn(s"Failed to get access token. Did you forget to run `az login`?")
+          log.debug(e.toString())
           None
       }
+    }
+  }
+
+  def updateCoursierConf(
+      conf: CoursierConfiguration,
+      resolvers: Seq[Resolver],
+      credentials: Seq[Credentials]) = {
+    val credMap = credentials.collect {
+      case credential: DirectCredentials =>
+        (credential.host, credential.userName) -> credential
+    }.toMap
+    val auths = resolvers.collect {
+      case repo: MavenRepo =>
+        val uri = new URI(repo.root)
+        for {
+          org <- getOrganization(uri)
+          credential <- credMap.get((uri.getHost, org))
+        } yield {
+          repo.name -> Authentication(credential.userName, credential.passwd)
+        }
+    }.flatten
+    auths.foldLeft(conf) { case (conf, (repoId, auth)) =>
+      val authenticationByRepositoryId = conf.authenticationByRepositoryId :+ (repoId, auth)
+      conf.withAuthenticationByRepositoryId(authenticationByRepositoryId)
     }
   }
 }
