@@ -8,6 +8,7 @@ pluginCrossBuild / sbtVersion := {
   }
 }
 
+scalaVersion := "2.12.19"
 javacOptions ++= Seq("-source", "1.8", "-target", "1.8")
 
 libraryDependencies += "com.azure" % "azure-identity" % "1.12.1"
