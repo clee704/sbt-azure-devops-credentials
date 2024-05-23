@@ -50,7 +50,6 @@ object AzureDevOpsCredentialsPlugin extends AutoPlugin {
       case credential: DirectCredentials =>
         (credential.host, credential.userName) -> credential
     }.toMap
-    val helper = new AzureDevOpsCredentialHelper(log)
     resolvers.collect {
       case repo: MavenRepo =>
         val uri = new URI(repo.root)
@@ -58,8 +57,8 @@ object AzureDevOpsCredentialsPlugin extends AutoPlugin {
         getOrganization(uri).flatMap { org =>
           if (!credMap.contains((host, org))) {
             for {
-              realm <- helper.getRealm(uri)
-              token <- helper.token
+              realm <- getRealm(uri, log)
+              token <- getToken(log)
             } yield {
               Credentials(realm, host, org, token)
             }
@@ -86,48 +85,55 @@ object AzureDevOpsCredentialsPlugin extends AutoPlugin {
     }
   }
 
-  class AzureDevOpsCredentialHelper(log: ManagedLogger) {
-    def getRealm(uri: URI): Option[String] = {
-      try {
-        val conn = uri.toURL.openConnection()
-        for {
-          values <- conn.getHeaderFields.asScala.get("WWW-Authenticate")
-          value <- values.asScala.find(_.startsWith("Basic realm="))
-          m <- "Basic realm=\"([^\"]*)\"".r.findFirstMatchIn(value)
-        } yield {
-          m.group(1)
-        }
-      } catch {
-        case NonFatal(e) =>
-          log.warn(s"Failed to get realm for host ${uri.getHost}: $e")
-          None
+  private def getRealm(uri: URI, log: ManagedLogger): Option[String] = {
+    try {
+      val conn = uri.toURL.openConnection()
+      for {
+        values <- conn.getHeaderFields.asScala.get("WWW-Authenticate")
+        value <- values.asScala.find(_.startsWith("Basic realm="))
+        m <- "Basic realm=\"([^\"]*)\"".r.findFirstMatchIn(value)
+      } yield {
+        m.group(1)
       }
-    }
-
-    lazy val token: Option[String] = {
-      log.info("Trying to get access token")
-      val credential = new DefaultAzureCredentialBuilder().build()
-      // Restrict token to Azure DevOps
-      val request = new TokenRequestContext().addScopes("499b84ac-1321-427f-aa17-267ca6975798")
-      try {
-        val token = credential.getToken(request).block()
-        if (token != null) {
-          log.info("Azure access token created")
-          Some(token.getToken())
-        } else {
-          log.warn(s"Failed to get access token (getToken() returned null)")
-          None
-        }
-      } catch {
-        case NonFatal(e) =>
-          log.warn(s"Failed to get access token. Did you forget to run `az login`?")
-          log.debug(e.toString())
-          None
-      }
+    } catch {
+      case NonFatal(e) =>
+        log.warn(s"Failed to get realm for host ${uri.getHost}: $e")
+        None
     }
   }
 
-  def updateCoursierConf(
+  private var cachedToken: Option[Option[String]] = None
+
+  private def getToken(log: ManagedLogger): Option[String] = synchronized {
+    if (!cachedToken.isDefined) {
+      cachedToken = Some(getTokenImpl(log))
+    }
+    cachedToken.get
+  }
+
+  private def getTokenImpl(log: ManagedLogger): Option[String] = {
+    log.info("Trying to get access token")
+    val credential = new DefaultAzureCredentialBuilder().build()
+    // Restrict token to Azure DevOps
+    val request = new TokenRequestContext().addScopes("499b84ac-1321-427f-aa17-267ca6975798")
+    try {
+      val token = credential.getToken(request).block()
+      if (token != null) {
+        log.info("Azure access token created")
+        Some(token.getToken())
+      } else {
+        log.warn(s"Failed to get access token (getToken() returned null)")
+        None
+      }
+    } catch {
+      case NonFatal(e) =>
+        log.warn(s"Failed to get access token. Did you forget to run `az login`?")
+        log.debug(e.toString())
+        None
+    }
+  }
+
+  private def updateCoursierConf(
       conf: CoursierConfiguration,
       resolvers: Seq[Resolver],
       credentials: Seq[Credentials]) = {
