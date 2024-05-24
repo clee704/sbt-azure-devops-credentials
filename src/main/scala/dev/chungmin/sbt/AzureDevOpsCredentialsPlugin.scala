@@ -48,14 +48,14 @@ object AzureDevOpsCredentialsPlugin extends AutoPlugin {
       log: ManagedLogger): Seq[Credentials] = {
     val credMap = existingCredentials.collect {
       case credential: DirectCredentials =>
-        (credential.host, credential.userName) -> credential
+        credential.host -> credential
     }.toMap
     resolvers.collect {
       case repo: MavenRepo =>
         val uri = new URI(repo.root)
         val host = uri.getHost
         getOrganization(uri).flatMap { org =>
-          if (!credMap.contains((host, org))) {
+          if (!credMap.contains(host)) {
             for {
               realm <- getRealm(uri, log)
               token <- getToken(log)
@@ -139,16 +139,13 @@ object AzureDevOpsCredentialsPlugin extends AutoPlugin {
       credentials: Seq[Credentials]) = {
     val credMap = credentials.collect {
       case credential: DirectCredentials =>
-        (credential.host, credential.userName) -> credential
+        credential.host -> credential
     }.toMap
     val auths = resolvers.collect {
       case repo: MavenRepo =>
         val uri = new URI(repo.root)
         val host = uri.getHost
-        for {
-          org <- getOrganization(uri)
-          credential <- credMap.get((host, org))
-        } yield {
+        credMap.get(host).map { credential =>
           repo.name -> Authentication(credential.userName, credential.passwd)
         }
     }.flatten
