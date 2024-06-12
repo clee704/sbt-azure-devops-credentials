@@ -33,7 +33,7 @@ object AzureDevOpsCredentialsPlugin extends AutoPlugin {
   override def trigger = allRequirements
 
   override lazy val projectSettings = Seq(
-    credentials ++= buildCredentials(credentials.value, resolvers.value, streams.value.log),
+    credentials ++= buildCredentials(credentials.value, externalResolvers.value, streams.value.log),
 
     // Fix for https://github.com/coursier/coursier/issues/1649
     csrConfiguration := updateCoursierConf(
