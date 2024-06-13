@@ -17,6 +17,7 @@ package dev.chungmin.sbt
 
 import scala.collection.JavaConverters._
 import scala.util.control.NonFatal
+import scala.xml.XML
 
 import sbt._
 import sbt.internal.util.ManagedLogger
@@ -29,7 +30,6 @@ import com.azure.core.credential.TokenRequestContext
 import com.azure.identity.DefaultAzureCredentialBuilder
 
 object AzureDevOpsCredentialsPlugin extends AutoPlugin {
-  override def requires = MavenSettingsCredentialsPlugin
   override def trigger = allRequirements
 
   override lazy val projectSettings = Seq(
@@ -43,6 +43,18 @@ object AzureDevOpsCredentialsPlugin extends AutoPlugin {
   )
 
   private def buildCredentials(
+      existingCredentials: Seq[Credentials],
+      resolvers: Seq[Resolver],
+      log: ManagedLogger): Seq[Credentials] = {
+    val credentialsFromMavenSettings = buildCredentialsFromMavenSettings(resolvers, log)
+    val generatedCredentials = buildCredentialsWithAccessToken(
+      existingCredentials ++ credentialsFromMavenSettings,
+      resolvers,
+      log)
+    credentialsFromMavenSettings ++ generatedCredentials
+  }
+
+  private def buildCredentialsWithAccessToken(
       existingCredentials: Seq[Credentials],
       resolvers: Seq[Resolver],
       log: ManagedLogger): Seq[Credentials] = {
@@ -153,5 +165,46 @@ object AzureDevOpsCredentialsPlugin extends AutoPlugin {
       val authenticationByRepositoryId = conf.authenticationByRepositoryId :+ (repoId, auth)
       conf.withAuthenticationByRepositoryId(authenticationByRepositoryId)
     }
+  }
+
+  private def buildCredentialsFromMavenSettings(
+      resolvers: Seq[Resolver], log: ManagedLogger): Seq[Credentials] = {
+    // TODO: support M2_HOME
+    val settingsFile = new File(sbt.io.Path.userHome, ".m2/settings.xml")
+    if (!settingsFile.exists) {
+      return Nil
+    }
+    val xml = XML.loadFile(settingsFile)
+    val servers = (xml \ "servers" \ "server").map { server =>
+      val id = (server \ "id").text
+      val username = (server \ "username").text
+      val password = (server \ "password").text
+      (id -> (username, password))
+    }.toMap
+    resolvers.collect {
+      case resolver: MavenRepo =>
+        servers.get(resolver.name).flatMap { server =>
+          val url = new URI(resolver.root).toURL
+          val host = url.getHost
+          val realmOpt = try {
+            val conn = url.openConnection()
+            conn.getHeaderFields.asScala.get("WWW-Authenticate").flatMap { values =>
+              values.asScala.find(_.startsWith("Basic realm=")).flatMap { value =>
+                // TODO proper parsing
+                "Basic realm=\"([^\"]*)\"".r.findFirstMatchIn(value).map { m =>
+                  m.group(1)
+                }
+              }
+            }
+          } catch {
+            case NonFatal(e) =>
+              log.warn(s"Failed to get realm for host $host: $e")
+              None
+          }
+          realmOpt.map { realm =>
+            Credentials(realm, host, server._1, server._2)
+          }
+        }
+    }.flatten
   }
 }

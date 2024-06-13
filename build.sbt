@@ -11,5 +11,3 @@ pluginCrossBuild / sbtVersion := {
 }
 
 libraryDependencies += "com.azure" % "azure-identity" % "1.12.1"
-
-addSbtPlugin("dev.chungmin" % "sbt-maven-settings-credentials" % "0.0.2")
