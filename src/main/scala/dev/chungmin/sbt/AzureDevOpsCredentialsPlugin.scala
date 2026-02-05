@@ -32,6 +32,27 @@ import com.azure.identity.DefaultAzureCredentialBuilder
 object AzureDevOpsCredentialsPlugin extends AutoPlugin {
   override def trigger = allRequirements
 
+  /** Extract organization name from Azure DevOps URL. Exposed for testing. */
+  private[sbt] def getOrganization(uri: URI): Option[String] = {
+    val host = uri.getHost
+    if (host == null) {
+      None
+    } else if (host.endsWith("pkgs.visualstudio.com")) {
+      Some(host.split("\\.").head)
+    } else if (host == "pkgs.dev.azure.com") {
+      // Path is like "/myorg/myproject/..." - split and filter empty strings
+      val pathFragments = uri.getPath.split("/").filter(_.nonEmpty)
+      pathFragments.headOption
+    } else {
+      None
+    }
+  }
+
+  /** Check if host is an Azure DevOps package feed. Exposed for testing. */
+  private[sbt] def isAzureDevOpsHost(host: String): Boolean = {
+    host != null && (host.endsWith("pkgs.visualstudio.com") || host == "pkgs.dev.azure.com")
+  }
+
   override lazy val projectSettings = Seq(
     credentials ++= new CredentialsBuilder(streams.value.log)
       .buildCredentials(credentials.value, externalResolvers.value),
@@ -68,7 +89,7 @@ object AzureDevOpsCredentialsPlugin extends AutoPlugin {
           val uri = new URI(repo.root)
           val host = uri.getHost
           if (!credMap.contains(host)) {
-            getOrganization(uri).flatMap { org =>
+            getOrganizationWithLog(uri).flatMap { org =>
               for {
                 realm <- getRealm(uri)
                 token <- getToken()
@@ -86,20 +107,8 @@ object AzureDevOpsCredentialsPlugin extends AutoPlugin {
       credentials
     }
 
-    private def getOrganization(uri: URI): Option[String] = {
-      val host = uri.getHost
-      val maybeOrg = if (host.endsWith("pkgs.visualstudio.com")) {
-        Some(host.split("\\.").head)
-      } else if (host == "pkgs.dev.azure.com") {
-        val pathFragments = uri.getPath.split("/")
-        if (pathFragments.size > 0) {
-          Some(pathFragments.head)
-        } else {
-          None
-        }
-      } else {
-        None
-      }
+    private def getOrganizationWithLog(uri: URI): Option[String] = {
+      val maybeOrg = AzureDevOpsCredentialsPlugin.getOrganization(uri)
       log.debug(s"found org=$maybeOrg from URI=$uri")
       maybeOrg
     }

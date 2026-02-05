@@ -11,3 +11,7 @@ pluginCrossBuild / sbtVersion := {
 }
 
 libraryDependencies += "com.azure" % "azure-identity" % "1.12.1"
+libraryDependencies += "org.scalatest" %% "scalatest" % "3.2.18" % Test
+
+// Exclude integration tests (tagged as Slow) by default
+Test / testOptions += Tests.Argument(TestFrameworks.ScalaTest, "-l", "org.scalatest.tagobjects.Slow")

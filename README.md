@@ -27,6 +27,10 @@ The plugin looks at `resolvers` and check if it's an Azure DevOps Maven feed. If
 
 You can run `sbt 'show credentials'` to check if the credentials are populated correctly.
 
+# Limitations
+
+This plugin only supports Azure DevOps Services (cloud). Azure DevOps Server (on-premises) is not supported, as it uses custom domains that cannot be auto-detected.
+
 # Troubleshooting
 
 To see debug output from the plugin, enable debug logging in sbt:

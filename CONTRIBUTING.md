@@ -6,6 +6,20 @@ Requirements:
 - JDK 8 or higher
 - sbt
 
+## Testing
+
+Run unit tests:
+```bash
+sbt test
+```
+
+Run integration tests (requires Azure login and a real Azure DevOps feed):
+```bash
+az login
+export AZURE_DEVOPS_TEST_URL=https://pkgs.dev.azure.com/myorg/myproject/_packaging/feed/maven/v1
+sbt test
+```
+
 ## Coding Conventions
 
 - Follow Scala 2.12 conventions
