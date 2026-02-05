@@ -26,3 +26,17 @@ resolvers += "InternalMaven" at "https://myorg.pkgs.visualstudio.com/myproject/_
 The plugin looks at `resolvers` and check if it's an Azure DevOps Maven feed. If that is the case and no credentials are already provided for the feed, the plugin creates an access token for it using the [Azure Identity client library](https://github.com/Azure/azure-sdk-for-java/blob/main/sdk/identity/azure-identity/README.md).
 
 You can run `sbt 'show credentials'` to check if the credentials are populated correctly.
+
+# Troubleshooting
+
+To see debug output from the plugin, enable debug logging in sbt:
+
+```bash
+sbt --debug
+```
+
+Or in the sbt shell:
+
+```
+set logLevel := Level.Debug
+```

@@ -73,7 +73,7 @@ object AzureDevOpsCredentialsPlugin extends AutoPlugin {
                 realm <- getRealm(uri)
                 token <- getToken()
               } yield {
-                log.info(s"creating credentials for realm=$realm, host=$host, user=$org")
+                log.debug(s"creating credentials for realm=$realm, host=$host, user=$org")
                 Credentials(realm, host, org, token)
               }
             }
@@ -82,7 +82,7 @@ object AzureDevOpsCredentialsPlugin extends AutoPlugin {
             None
           }
       }.flatten
-      log.info(s"created ${credentials.size} credentials with access token")
+      log.debug(s"created ${credentials.size} credentials with access token")
       credentials
     }
 
@@ -134,14 +134,14 @@ object AzureDevOpsCredentialsPlugin extends AutoPlugin {
     }
 
     private def getTokenImpl(): Option[String] = {
-      log.info("trying to create access token")
+      log.debug("trying to create access token")
       val credential = new DefaultAzureCredentialBuilder().build()
       // Restrict token to Azure DevOps
       val request = new TokenRequestContext().addScopes("499b84ac-1321-427f-aa17-267ca6975798")
       try {
         val token = credential.getToken(request).block()
         if (token != null) {
-          log.info("access token created")
+          log.debug("access token created")
           Some(token.getToken())
         } else {
           log.warn(s"failed to get access token (getToken() returned null)")
@@ -170,7 +170,7 @@ object AzureDevOpsCredentialsPlugin extends AutoPlugin {
         val password = (server \ "password").text
         (id -> (username, password))
       }.toMap
-      log.info(s"loaded $settingsFile")
+      log.debug(s"loaded $settingsFile")
       val credentials = resolvers.collect {
         case repo: MavenRepo =>
           log.debug(s"found a MavenRepo $repo from resolvers")
@@ -181,7 +181,7 @@ object AzureDevOpsCredentialsPlugin extends AutoPlugin {
             val host = uri.getHost
             val (user, password) = server
             getRealm(uri).map { realm =>
-              log.info(s"creating credentials for realm=$realm, host=$host, user=$user")
+              log.debug(s"creating credentials for realm=$realm, host=$host, user=$user")
               Credentials(realm, host, user, password)
             }
           }.getOrElse {
@@ -189,7 +189,7 @@ object AzureDevOpsCredentialsPlugin extends AutoPlugin {
             None
           }
       }.flatten
-      log.info(s"created ${credentials.size} credentials from settings.xml")
+      log.debug(s"created ${credentials.size} credentials from settings.xml")
       credentials
     }
   }
