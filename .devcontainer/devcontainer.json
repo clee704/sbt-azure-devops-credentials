@@ -1,0 +1,16 @@
+{
+  "name": "sbt-azure-devops-credentials",
+  "build": {
+    "dockerfile": "Dockerfile"
+  },
+  "features": {
+    "ghcr.io/devcontainers/features/azure-cli:1": {}
+  },
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "scalameta.metals"
+      ]
+    }
+  }
+}

@@ -2,6 +2,12 @@
 
 ## Development
 
+### Using the Dev Container (recommended)
+
+Open this project in VS Code with the [Dev Containers extension](https://marketplace.visualstudio.com/items?itemName=ms-vscode-remote.remote-containers). The container includes JDK, sbt, and Azure CLI pre-configured.
+
+### Manual Setup
+
 Requirements:
 - JDK 8 or higher
 - sbt
