@@ -64,3 +64,26 @@ fix: handle missing realm in HTTP response
 docs: add troubleshooting section to README
 refactor: change info logs to debug level
 ```
+
+## Releasing
+
+### Prerequisites
+
+- GPG key for signing artifacts
+- Sonatype credentials (set `SONATYPE_USERNAME` and `SONATYPE_PASSWORD` environment variables)
+
+### Release Steps
+
+1. Run the release script:
+   ```bash
+   ./release.sh 0.0.6
+   ```
+   This updates version files, commits, tags, and creates a signed bundle.
+   If Sonatype credentials are set, it also uploads the bundle automatically.
+
+2. Go to [Sonatype Central Portal](https://central.sonatype.com/publishing/deployments), verify the deployment, and click "Publish".
+
+3. Finish the release (bumps to next snapshot and pushes):
+   ```bash
+   ./release.sh --finish 0.0.6
+   ```

@@ -6,6 +6,9 @@
   "features": {
     "ghcr.io/devcontainers/features/azure-cli:1": {}
   },
+  "mounts": [
+    "source=${localEnv:HOME}/.gnupg,target=/home/vscode/.gnupg,type=bind,consistency=cached"
+  ],
   "customizations": {
     "vscode": {
       "extensions": [
