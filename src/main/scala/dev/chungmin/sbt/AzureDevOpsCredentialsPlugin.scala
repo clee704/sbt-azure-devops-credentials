@@ -15,7 +15,11 @@
 // limitations under the License.
 package dev.chungmin.sbt
 
-import scala.collection.JavaConverters._
+import java.io.{BufferedReader, BufferedWriter, InputStreamReader, OutputStreamWriter}
+import java.net.{InetSocketAddress, Socket}
+
+import javax.net.ssl.SSLSocketFactory
+
 import scala.util.control.NonFatal
 import scala.xml.XML
 
@@ -51,6 +55,55 @@ object AzureDevOpsCredentialsPlugin extends AutoPlugin {
   /** Check if host is an Azure DevOps package feed. Exposed for testing. */
   private[sbt] def isAzureDevOpsHost(host: String): Boolean = {
     host != null && (host.endsWith("pkgs.visualstudio.com") || host == "pkgs.dev.azure.com")
+  }
+
+  /** Send an unauthenticated HEAD request and return the response headers.
+    *
+    * Uses a raw socket instead of HttpURLConnection to avoid triggering
+    * sbt's global IvyAuthenticator, which logs spurious "Unable to find
+    * credentials" error messages when the server responds with 401. */
+  private[sbt] def headRequestHeaders(uri: URI): Seq[(String, String)] = {
+    val host = uri.getHost
+    val port = if (uri.getPort >= 0) uri.getPort else
+      (if (uri.getScheme == "https") 443 else 80)
+    val path = Option(uri.getRawPath).filter(_.nonEmpty).getOrElse("/")
+    val rawSocket = new Socket()
+    try {
+      rawSocket.connect(new InetSocketAddress(host, port), 10000)
+      rawSocket.setSoTimeout(10000)
+      val socket = if (uri.getScheme == "https") {
+        SSLSocketFactory.getDefault.asInstanceOf[SSLSocketFactory]
+          .createSocket(rawSocket, host, port, /* autoClose = */ true)
+      } else {
+        rawSocket
+      }
+      try {
+        val writer = new BufferedWriter(
+          new OutputStreamWriter(socket.getOutputStream, "UTF-8"))
+        writer.write(
+          s"HEAD $path HTTP/1.1\r\nHost: $host\r\nConnection: close\r\n\r\n")
+        writer.flush()
+        val reader = new BufferedReader(
+          new InputStreamReader(socket.getInputStream, "UTF-8"))
+        val headers = Seq.newBuilder[(String, String)]
+        reader.readLine() // skip status line
+        var line = reader.readLine()
+        while (line != null && line.nonEmpty) {
+          val colon = line.indexOf(':')
+          if (colon > 0) {
+            headers += (line.substring(0, colon).trim -> line.substring(colon + 1).trim)
+          }
+          line = reader.readLine()
+        }
+        headers.result()
+      } finally {
+        socket.close()
+      }
+    } catch {
+      case NonFatal(e) =>
+        rawSocket.close()
+        throw e
+    }
   }
 
   override lazy val projectSettings = Seq(
@@ -115,15 +168,13 @@ object AzureDevOpsCredentialsPlugin extends AutoPlugin {
 
     private def getRealm(uri: URI): Option[String] = {
       try {
-        val conn = uri.toURL.openConnection()
-        // TODO proper parsing
-        val realm = for {
-          values <- conn.getHeaderFields.asScala.get("WWW-Authenticate")
-          value <- values.asScala.find(_.startsWith("Basic realm="))
-          m <- "Basic realm=\"([^\"]*)\"".r.findFirstMatchIn(value)
-        } yield {
-          m.group(1)
-        }
+        val headers = AzureDevOpsCredentialsPlugin.headRequestHeaders(uri)
+        val realm = headers.collectFirst {
+          case (name, value)
+              if name.equalsIgnoreCase("WWW-Authenticate") &&
+                 value.startsWith("Basic realm=") =>
+            "Basic realm=\"([^\"]*)\"".r.findFirstMatchIn(value).map(_.group(1))
+        }.flatten
         log.debug(s"found realm=$realm for URI=$uri")
         realm
       } catch {
