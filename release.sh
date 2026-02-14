@@ -229,7 +229,7 @@ sed -i "s/sbt-azure-devops-credentials\" % \"[^\"]*\"/sbt-azure-devops-credentia
 info "Committing and tagging"
 git add version.sbt README.md
 git commit -m "chore: release v$VERSION"
-git tag "v$VERSION"
+git tag -s "v$VERSION" -m "Release v$VERSION"
 
 # Build signed bundle
 info "Building signed bundle"
