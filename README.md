@@ -7,7 +7,7 @@ Requirements:
 Add the following lines to `project/plugins.sbt`:
 
 ```scala
-addSbtPlugin("dev.chungmin" % "sbt-azure-devops-credentials" % "0.0.6")
+addSbtPlugin("dev.chungmin" % "sbt-azure-devops-credentials" % "0.0.7")
 ```
 
 You should log in to Azure by using `az login`. Once you're logged in, the plugin will
