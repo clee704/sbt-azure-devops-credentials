@@ -84,6 +84,18 @@ object AzureDevOpsCredentialsPlugin extends AutoPlugin {
       }
     }
 
+  /** Snapshot of the suppression counter for test-isolation assertions.
+    * The counted-set state ([[suppressionCount]] and
+    * [[savedAzureIdentityLogLevel]]) is JVM-global and persists across tests
+    * within the same JVM. A future test (or a refactor of an existing one)
+    * that leaks an unmatched acquire would otherwise manifest as a confusing
+    * failure in a downstream test — the symptom (a wrong property value)
+    * surfaces several tests away from the leak source. Exposed as
+    * `private[sbt]` so test code can assert `count == 0` between tests and
+    * pin any future leak to its actual source. */
+  private[sbt] def suppressionCountForTesting: Int =
+    AzureIdentityLogSuppressionLock.synchronized { suppressionCount }
+
   /** Normalize an env-var value: trim surrounding whitespace and return
     * `Some(trimmed)` when the result is non-empty; `None` for absent, empty,
     * or whitespace-only values. Extracted as a pure helper so the trim+filter

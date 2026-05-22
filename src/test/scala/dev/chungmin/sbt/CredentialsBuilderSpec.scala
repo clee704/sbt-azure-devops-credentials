@@ -24,6 +24,7 @@ import javax.net.ssl.SSLException
 
 import scala.util.control.NonFatal
 
+import org.scalatest.BeforeAndAfter
 import org.scalatest.flatspec.AnyFlatSpec
 import org.scalatest.matchers.should.Matchers
 
@@ -34,7 +35,17 @@ import lmcoursier.definitions.Authentication
 import com.azure.core.credential.{AccessToken, TokenCredential, TokenRequestContext}
 import reactor.core.publisher.Mono
 
-class CredentialsBuilderSpec extends AnyFlatSpec with Matchers {
+class CredentialsBuilderSpec extends AnyFlatSpec with Matchers with BeforeAndAfter {
+
+  // Defense in depth for the JVM-global suppression counter. `before` catches
+  // contamination from another spec running in the same JVM; `after` pins any
+  // leak in *this* spec to the exact test that caused it (otherwise a leak
+  // surfaces as a confusing assertion failure in the next test that reads
+  // the Azure-identity log-level property — see the nested-suppression test
+  // for the canonical "wrong saved value" symptom that would result). We
+  // assert rather than reset so leaks remain visible instead of being masked.
+  before { AzureDevOpsCredentialsPlugin.suppressionCountForTesting shouldBe 0 }
+  after  { AzureDevOpsCredentialsPlugin.suppressionCountForTesting shouldBe 0 }
 
   // ─── Test fixtures ─────────────────────────────────────────────────────
 
