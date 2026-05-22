@@ -57,9 +57,10 @@ object AzureDevOpsCredentialsPlugin extends AutoPlugin {
     *
     * WorkloadIdentityCredentialBuilder.build() validates eagerly and throws
     * IllegalArgumentException unless its clientId / tenantId / tokenFilePath are
-    * all set. Unlike DefaultAzureCredential, it does NOT auto-read AZURE_CLIENT_ID
-    * / AZURE_TENANT_ID / AZURE_FEDERATED_TOKEN_FILE from the environment, so we
-    * populate them ourselves. When those env vars are absent (the common case on
+    * all set to non-null AND non-empty values. Unlike DefaultAzureCredential,
+    * it does NOT auto-read AZURE_CLIENT_ID / AZURE_TENANT_ID /
+    * AZURE_FEDERATED_TOKEN_FILE from the environment, so we populate them
+    * ourselves. When those env vars are absent or empty (the common case on
     * dev workstations) we skip the credential entirely; otherwise the chain
     * assembly would fail before AzureCli is ever tried.
     *
@@ -71,9 +72,9 @@ object AzureDevOpsCredentialsPlugin extends AutoPlugin {
       .addLast(new AzurePowerShellCredentialBuilder().build())
       .addLast(new EnvironmentCredentialBuilder().build())
     for {
-      clientId <- env.get("AZURE_CLIENT_ID")
-      tenantId <- env.get("AZURE_TENANT_ID")
-      tokenFile <- env.get("AZURE_FEDERATED_TOKEN_FILE")
+      clientId  <- env.get("AZURE_CLIENT_ID").filter(_.nonEmpty)
+      tenantId  <- env.get("AZURE_TENANT_ID").filter(_.nonEmpty)
+      tokenFile <- env.get("AZURE_FEDERATED_TOKEN_FILE").filter(_.nonEmpty)
     } {
       builder.addLast(
         new WorkloadIdentityCredentialBuilder()

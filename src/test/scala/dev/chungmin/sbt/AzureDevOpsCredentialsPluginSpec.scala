@@ -190,4 +190,35 @@ class AzureDevOpsCredentialsPluginSpec extends AnyFlatSpec with Matchers {
     val cred = AzureDevOpsCredentialsPlugin.createCredential(env)
     cred should not be null
   }
+
+  it should "build a chain without throwing when AAD env vars are present but empty" in {
+    // The Azure SDK's WorkloadIdentityCredentialBuilder.build() rejects both
+    // null AND empty strings — `env.get("AZURE_CLIENT_ID")` returning Some("")
+    // would re-trigger the same eager IllegalArgumentException that broke
+    // v0.0.8, just by a different code path. Some CI images, partially-
+    // configured shells, and k8s service-account projection edge cases can
+    // export env vars as empty strings, so this case needs the same
+    // skip-the-credential treatment as "var entirely absent".
+    val env = Map(
+      "AZURE_CLIENT_ID" -> "",
+      "AZURE_TENANT_ID" -> "",
+      "AZURE_FEDERATED_TOKEN_FILE" -> ""
+    )
+    val cred = AzureDevOpsCredentialsPlugin.createCredential(env)
+    cred should not be null
+  }
+
+  it should "build a chain without throwing when only some AAD env vars are empty" in {
+    // Mixed case: AZURE_CLIENT_ID is empty but the other two are set. Without
+    // the per-value .filter(_.nonEmpty), the for-comprehension would still
+    // succeed (Some("") satisfies the comprehension) and the builder's
+    // .clientId("") + .build() would throw.
+    val env = Map(
+      "AZURE_CLIENT_ID" -> "",
+      "AZURE_TENANT_ID" -> "00000000-0000-0000-0000-000000000000",
+      "AZURE_FEDERATED_TOKEN_FILE" -> "/tmp/nonexistent-federated-token"
+    )
+    val cred = AzureDevOpsCredentialsPlugin.createCredential(env)
+    cred should not be null
+  }
 }
