@@ -24,7 +24,7 @@ import scala.util.control.NonFatal
 import scala.xml.XML
 
 import sbt._
-import sbt.internal.util.ManagedLogger
+import sbt.util.Logger
 import Keys._
 
 import lmcoursier.CoursierConfiguration
@@ -158,6 +158,7 @@ object AzureDevOpsCredentialsPlugin extends AutoPlugin {
     }
   }
 
+  // $COVERAGE-OFF$ sbt task wiring — exercised only inside a real sbt build, not unit-testable
   override lazy val projectSettings = Seq(
     credentials ++= new CredentialsBuilder(streams.value.log)
       .buildCredentials(credentials.value, externalResolvers.value),
@@ -168,8 +169,9 @@ object AzureDevOpsCredentialsPlugin extends AutoPlugin {
     updateClassifiers / csrConfiguration :=
         csrConfiguration.value.withClassifiers(Vector("sources")).withHasClassifiers(true)
   )
+  // $COVERAGE-ON$
 
-  class CredentialsBuilder(log: ManagedLogger) {
+  class CredentialsBuilder(log: Logger) {
     def buildCredentials(
         existingCredentials: Seq[Credentials],
         resolvers: Seq[Resolver]): Seq[Credentials] = {
@@ -179,6 +181,13 @@ object AzureDevOpsCredentialsPlugin extends AutoPlugin {
         resolvers)
       credentialsFromMavenSettings ++ generatedCredentials
     }
+
+    /** Location of the Maven settings.xml file. Overridable for testing. */
+    protected def mavenSettingsFile: File = new File(sbt.io.Path.userHome, ".m2/settings.xml")
+
+    /** Create the TokenCredential chain used by [[getTokenImpl]]. Overridable
+      * for testing so the Azure SDK does not have to be exercised. */
+    protected def newCredential(): TokenCredential = AzureDevOpsCredentialsPlugin.createCredential()
 
     private def buildCredentialsWithAccessToken(
         existingCredentials: Seq[Credentials],
@@ -218,7 +227,8 @@ object AzureDevOpsCredentialsPlugin extends AutoPlugin {
       maybeOrg
     }
 
-    private def getRealm(uri: URI): Option[String] = {
+    /** Discover the BASIC auth realm advertised by the feed. Overridable for testing. */
+    protected def getRealm(uri: URI): Option[String] = {
       try {
         val headers = AzureDevOpsCredentialsPlugin.headRequestHeaders(uri)
         val realm = headers.collectFirst {
@@ -238,7 +248,8 @@ object AzureDevOpsCredentialsPlugin extends AutoPlugin {
 
     private var cachedToken: Option[Option[String]] = None
 
-    private def getToken(): Option[String] = synchronized {
+    /** Acquire and cache an Azure DevOps access token. Overridable for testing. */
+    protected def getToken(): Option[String] = synchronized {
       if (!cachedToken.isDefined) {
         cachedToken = Some(getTokenImpl())
       }
@@ -253,7 +264,7 @@ object AzureDevOpsCredentialsPlugin extends AutoPlugin {
       val previousLevel = Option(System.getProperty(AzureIdentityLogProperty))
       System.setProperty(AzureIdentityLogProperty, "off")
       try {
-        val credential = createCredential()
+        val credential = newCredential()
         val request = new TokenRequestContext().addScopes(AzureDevOpsScope)
         val token = credential.getToken(request).block()
         if (token != null) {
@@ -278,7 +289,7 @@ object AzureDevOpsCredentialsPlugin extends AutoPlugin {
 
     private def buildCredentialsFromMavenSettings(resolvers: Seq[Resolver]): Seq[Credentials] = {
       // TODO: support M2_HOME
-      val settingsFile = new File(sbt.io.Path.userHome, ".m2/settings.xml")
+      val settingsFile = mavenSettingsFile
       log.debug(s"trying to load credentials from $settingsFile")
       if (!settingsFile.exists) {
         log.debug(s"file not found: $settingsFile")
@@ -316,7 +327,7 @@ object AzureDevOpsCredentialsPlugin extends AutoPlugin {
   }
 
   // Fix for https://github.com/coursier/coursier/issues/1649
-  private def updateCoursierConf(
+  private[sbt] def updateCoursierConf(
       conf: CoursierConfiguration,
       resolvers: Seq[Resolver],
       credentials: Seq[Credentials]) = {
