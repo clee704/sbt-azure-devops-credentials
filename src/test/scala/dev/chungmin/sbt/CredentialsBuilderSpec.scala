@@ -18,7 +18,8 @@ package dev.chungmin.sbt
 import java.io.{BufferedWriter, File, OutputStreamWriter, PrintWriter}
 import java.net.{ServerSocket, URI}
 import java.nio.file.Files
-import java.time.OffsetDateTime
+import java.time.{Duration, OffsetDateTime}
+import java.util.concurrent.CountDownLatch
 import javax.net.ssl.SSLException
 
 import scala.util.control.NonFatal
@@ -334,6 +335,27 @@ class CredentialsBuilderSpec extends AnyFlatSpec with Matchers {
     calls shouldBe 1
   }
 
+  it should "cache the None result and not re-try on subsequent calls" in {
+    // Companion to the Some-caching test above: `cachedToken` is
+    // Option[Option[String]] precisely to distinguish "not yet attempted"
+    // from "attempted, no token". Without this assertion, a future refactor
+    // to Option[String] semantics (treating None as "not yet attempted")
+    // would silently re-trigger the full chain on every resolver in a
+    // misconfigured sbt build — exactly what the cache exists to prevent.
+    var calls = 0
+    val probe = new AzureDevOpsCredentialsPlugin.CredentialsBuilder(nullLog) {
+      override protected def newCredential(): TokenCredential = {
+        calls += 1
+        fakeCredential(Mono.error[AccessToken](new RuntimeException("boom")))
+      }
+      def fetch(): Option[String] = getToken()
+    }
+    probe.fetch() shouldBe None
+    probe.fetch() shouldBe None
+    probe.fetch() shouldBe None
+    calls shouldBe 1
+  }
+
   it should "restore the previous Azure-identity log level after token acquisition" in {
     val prop = "org.slf4j.simpleLogger.log.com.azure.identity"
     val original = Option(System.getProperty(prop))
@@ -365,19 +387,43 @@ class CredentialsBuilderSpec extends AnyFlatSpec with Matchers {
     // Regression guard for the save/set/restore race: without a JVM-wide
     // counted-set, two builders could observe each other's "off" mutation and
     // leave the property pinned to "off" after both threads finish.
+    //
+    // The pre-fix code synchronized only on the CredentialsBuilder instance,
+    // so concurrent instances' save/set/restore blocks could interleave.
+    // The race window is the time between save (read property as X) and
+    // restore (write property back to X). To actually exercise that window,
+    // (a) all 8 threads gate on a CountDownLatch so they enter the
+    // acquire/SDK/release path within nanoseconds of each other, and
+    // (b) the credential's Mono is delayed by 50ms so the per-thread
+    // critical section is long enough for the interleaving to happen.
+    // (`Mono.just(...)` would resolve in microseconds — shorter than the
+    // cost of starting the next Thread — and the threads would typically
+    // run sequentially, neutering the regression guard.)
+    //
+    // This is paired with the deterministic counted-set invariant test
+    // below ("keep ... pinned to 'off' across nested suppressions"). This
+    // 8-thread variant verifies the live integration path through
+    // getTokenImpl; the nested-suppression test verifies the counted-set
+    // helpers directly.
     val prop = "org.slf4j.simpleLogger.log.com.azure.identity"
     val original = Option(System.getProperty(prop))
     System.setProperty(prop, "initial")
     try {
+      val barrier = new CountDownLatch(1)
       val threads = (1 to 8).map { i =>
         val t = new Thread(new Runnable {
           def run(): Unit = {
-            new TokenProbe(credentialReturning(s"tok-$i")).fetch()
+            val delayedCred = fakeCredential(
+              Mono.just(new AccessToken(s"tok-$i", OffsetDateTime.now().plusHours(1)))
+                .delayElement(Duration.ofMillis(50)))
+            barrier.await()
+            new TokenProbe(delayedCred).fetch()
           }
         })
         t.start()
         t
       }
+      barrier.countDown()
       threads.foreach(_.join())
       System.getProperty(prop) shouldBe "initial"
     } finally {

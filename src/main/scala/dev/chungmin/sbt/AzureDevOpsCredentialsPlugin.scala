@@ -84,6 +84,15 @@ object AzureDevOpsCredentialsPlugin extends AutoPlugin {
       }
     }
 
+  /** Normalize an env-var value: trim surrounding whitespace and return
+    * `Some(trimmed)` when the result is non-empty; `None` for absent, empty,
+    * or whitespace-only values. Extracted as a pure helper so the trim+filter
+    * behavior is directly unit-testable (verifying via [[createCredential]]
+    * alone would be tautological — the SDK builder accepts padded values, so
+    * a chain-assembly assertion doesn't prove the trim ran). */
+  private[sbt] def envValue(env: Map[String, String], key: String): Option[String] =
+    env.get(key).map(_.trim).filter(_.nonEmpty)
+
   /** Create a credential chain that prioritizes user credentials over managed identity.
     * Order: AzureCli → AzurePowerShell → Environment → WorkloadIdentity → ManagedIdentity.
     * This ensures user's az login or Azure PowerShell session is preferred over VM identity.
@@ -93,9 +102,13 @@ object AzureDevOpsCredentialsPlugin extends AutoPlugin {
     * all set to non-null AND non-empty values. Unlike DefaultAzureCredential,
     * it does NOT auto-read AZURE_CLIENT_ID / AZURE_TENANT_ID /
     * AZURE_FEDERATED_TOKEN_FILE from the environment, so we populate them
-    * ourselves. When those env vars are absent, empty, or whitespace-only (the
-    * common case on dev workstations) we skip the credential entirely; otherwise
-    * the chain assembly would fail before AzureCli is ever tried.
+    * ourselves via [[envValue]]. When those env vars are absent, empty, or
+    * whitespace-only (the common case on dev workstations) we skip the
+    * credential entirely; otherwise the chain assembly would fail before
+    * AzureCli is ever tried. Padded values (e.g. a trailing newline from a
+    * broken env-template substitution) are trimmed before reaching the SDK,
+    * since the SDK accepts them at build time but they'd fail at getToken
+    * time and add noise to the chain.
     *
     * The env parameter exists for testability — production callers should use
     * the default. */
@@ -105,9 +118,9 @@ object AzureDevOpsCredentialsPlugin extends AutoPlugin {
       .addLast(new AzurePowerShellCredentialBuilder().build())
       .addLast(new EnvironmentCredentialBuilder().build())
     for {
-      clientId  <- env.get("AZURE_CLIENT_ID").filter(_.trim.nonEmpty)
-      tenantId  <- env.get("AZURE_TENANT_ID").filter(_.trim.nonEmpty)
-      tokenFile <- env.get("AZURE_FEDERATED_TOKEN_FILE").filter(_.trim.nonEmpty)
+      clientId  <- envValue(env, "AZURE_CLIENT_ID")
+      tenantId  <- envValue(env, "AZURE_TENANT_ID")
+      tokenFile <- envValue(env, "AZURE_FEDERATED_TOKEN_FILE")
     } {
       builder.addLast(
         new WorkloadIdentityCredentialBuilder()

@@ -235,4 +235,37 @@ class AzureDevOpsCredentialsPluginSpec extends AnyFlatSpec with Matchers {
     val cred = AzureDevOpsCredentialsPlugin.createCredential(env)
     cred should not be null
   }
+
+  it should "build a chain without throwing when AAD env vars are padded with whitespace" in {
+    // Continuation of the whitespace defense above: a partially-broken
+    // env-template substitution may produce a *padded* value (e.g. trailing
+    // newline from a YAML literal block) rather than a pure-whitespace one.
+    // The SDK builder accepts padded values at .build() time, so this test
+    // doesn't tautologically verify the trim — that's what `envValue`'s
+    // direct unit tests are for. This is a smoke test that the chain
+    // assembly path tolerates padded values.
+    val env = Map(
+      "AZURE_CLIENT_ID" -> "  00000000-0000-0000-0000-000000000000  ",
+      "AZURE_TENANT_ID" -> "\t00000000-0000-0000-0000-000000000000\n",
+      "AZURE_FEDERATED_TOKEN_FILE" -> "  /tmp/nonexistent-federated-token  "
+    )
+    val cred = AzureDevOpsCredentialsPlugin.createCredential(env)
+    cred should not be null
+  }
+
+  "envValue" should "return Some(trimmed) for padded values" in {
+    val env = Map("X" -> "  abc  ", "Y" -> "\tabc\n", "Z" -> "abc")
+    AzureDevOpsCredentialsPlugin.envValue(env, "X") shouldBe Some("abc")
+    AzureDevOpsCredentialsPlugin.envValue(env, "Y") shouldBe Some("abc")
+    AzureDevOpsCredentialsPlugin.envValue(env, "Z") shouldBe Some("abc")
+  }
+
+  it should "return None for absent, empty, or whitespace-only values" in {
+    val env = Map("empty" -> "", "spaces" -> "   ", "tabs" -> "\t\t", "mixed" -> "  \n\t  ")
+    AzureDevOpsCredentialsPlugin.envValue(env, "empty") shouldBe None
+    AzureDevOpsCredentialsPlugin.envValue(env, "spaces") shouldBe None
+    AzureDevOpsCredentialsPlugin.envValue(env, "tabs") shouldBe None
+    AzureDevOpsCredentialsPlugin.envValue(env, "mixed") shouldBe None
+    AzureDevOpsCredentialsPlugin.envValue(env, "missing") shouldBe None
+  }
 }
