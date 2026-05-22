@@ -31,12 +31,14 @@ import lmcoursier.CoursierConfiguration
 import lmcoursier.definitions.Authentication
 
 import com.azure.core.credential.{TokenCredential, TokenRequestContext}
-import com.azure.identity.AzureCliCredentialBuilder
-import com.azure.identity.AzurePowerShellCredentialBuilder
-import com.azure.identity.ChainedTokenCredentialBuilder
-import com.azure.identity.EnvironmentCredentialBuilder
-import com.azure.identity.ManagedIdentityCredentialBuilder
-import com.azure.identity.WorkloadIdentityCredentialBuilder
+import com.azure.identity.{
+  AzureCliCredentialBuilder,
+  AzurePowerShellCredentialBuilder,
+  ChainedTokenCredentialBuilder,
+  EnvironmentCredentialBuilder,
+  ManagedIdentityCredentialBuilder,
+  WorkloadIdentityCredentialBuilder
+}
 
 object AzureDevOpsCredentialsPlugin extends AutoPlugin {
   override def trigger = allRequirements

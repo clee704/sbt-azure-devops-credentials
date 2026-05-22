@@ -21,6 +21,8 @@ import org.scalatest.flatspec.AnyFlatSpec
 import org.scalatest.matchers.should.Matchers
 import org.scalatest.tagobjects.Slow
 
+import com.azure.core.credential.TokenRequestContext
+
 /**
  * Integration tests that require a real Azure DevOps endpoint and Azure login.
  *
@@ -39,7 +41,7 @@ class AzureDevOpsCredentialsIntegrationSpec extends AnyFlatSpec with Matchers {
     assume(testUrl.isDefined, "Set AZURE_DEVOPS_TEST_URL to run this test")
 
     val credential = AzureDevOpsCredentialsPlugin.createCredential()
-    val request = new com.azure.core.credential.TokenRequestContext()
+    val request = new TokenRequestContext()
       .addScopes(AzureDevOpsCredentialsPlugin.AzureDevOpsScope)
 
     val token = credential.getToken(request).block()
