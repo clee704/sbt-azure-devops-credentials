@@ -16,12 +16,12 @@
 package dev.chungmin.sbt
 
 import java.net.URI
+import java.util.Base64
 import org.scalatest.flatspec.AnyFlatSpec
 import org.scalatest.matchers.should.Matchers
 import org.scalatest.tagobjects.Slow
 
 import com.azure.core.credential.TokenRequestContext
-import com.azure.identity.DefaultAzureCredentialBuilder
 
 /**
  * Integration tests that require a real Azure DevOps endpoint and Azure login.
@@ -32,20 +32,41 @@ import com.azure.identity.DefaultAzureCredentialBuilder
  * 3. Run: `sbt "testOnly *IntegrationSpec"`
  *
  * These tests are tagged as Slow and skipped by default.
+ *
+ * The user-token assertion (`upn` claim) is intended for interactive auth
+ * (Azure CLI or Azure PowerShell). It will fail for service-principal or
+ * federated-workload-identity tokens, which do not carry a `upn` claim — those
+ * are valid for the plugin's purposes but out of scope for this dev-box
+ * regression test (which exists to catch the IMDS-hijack bug from issue #3).
  */
 class AzureDevOpsCredentialsIntegrationSpec extends AnyFlatSpec with Matchers {
 
   val testUrl: Option[String] = sys.env.get("AZURE_DEVOPS_TEST_URL")
 
-  "Azure Identity" should "obtain an access token" taggedAs Slow in {
+  "Azure Identity" should "obtain a user access token (not MI token)" taggedAs Slow in {
     assume(testUrl.isDefined, "Set AZURE_DEVOPS_TEST_URL to run this test")
 
-    val credential = new DefaultAzureCredentialBuilder().build()
-    val request = new TokenRequestContext().addScopes("499b84ac-1321-427f-aa17-267ca6975798")
+    val credential = AzureDevOpsCredentialsPlugin.createCredential()
+    val request = new TokenRequestContext()
+      .addScopes(AzureDevOpsCredentialsPlugin.AzureDevOpsScope)
 
     val token = credential.getToken(request).block()
     token should not be null
-    token.getToken should not be empty
+    val tokenString = token.getToken
+    tokenString should not be empty
+
+    // Decode JWT to verify it's a user token (has UPN) not an MI service principal token.
+    // JWT format: header.payload.signature - we need the payload (middle part)
+    val parts = tokenString.split('.')
+    parts should have length 3
+
+    // Base64 decode the payload. JWT uses URL-safe base64 without padding.
+    val payloadBytes = Base64.getUrlDecoder.decode(parts(1))
+    val payload = new String(payloadBytes, "UTF-8")
+
+    // User tokens have "upn" (User Principal Name) claim; MI tokens do not.
+    // This proves we got the user's credential, not the VM's managed identity.
+    payload should include ("\"upn\":")
   }
 
   "getOrganization" should "extract org from user-provided URL" taggedAs Slow in {
