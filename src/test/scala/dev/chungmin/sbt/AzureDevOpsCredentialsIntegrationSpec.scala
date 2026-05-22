@@ -32,6 +32,12 @@ import com.azure.core.credential.TokenRequestContext
  * 3. Run: `sbt "testOnly *IntegrationSpec"`
  *
  * These tests are tagged as Slow and skipped by default.
+ *
+ * The user-token assertion (`upn` claim) is intended for interactive auth
+ * (Azure CLI or Azure PowerShell). It will fail for service-principal or
+ * federated-workload-identity tokens, which do not carry a `upn` claim — those
+ * are valid for the plugin's purposes but out of scope for this dev-box
+ * regression test (which exists to catch the IMDS-hijack bug from issue #3).
  */
 class AzureDevOpsCredentialsIntegrationSpec extends AnyFlatSpec with Matchers {
 
