@@ -15,3 +15,8 @@ libraryDependencies += "org.scalatest" %% "scalatest" % "3.2.18" % Test
 
 // Exclude integration tests (tagged as Slow) by default
 Test / testOptions += Tests.Argument(TestFrameworks.ScalaTest, "-l", "org.scalatest.tagobjects.Slow")
+
+// Coverage thresholds — keep them tight so regressions in test discipline fail CI.
+coverageMinimumStmtTotal := 95
+coverageMinimumBranchTotal := 95
+coverageFailOnMinimum := true
