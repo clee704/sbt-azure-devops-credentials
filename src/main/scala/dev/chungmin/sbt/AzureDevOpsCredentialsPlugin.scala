@@ -30,14 +30,37 @@ import Keys._
 import lmcoursier.CoursierConfiguration
 import lmcoursier.definitions.Authentication
 
-import com.azure.core.credential.TokenRequestContext
+import com.azure.core.credential.{TokenCredential, TokenRequestContext}
 import com.azure.identity.AzureCliCredentialBuilder
+import com.azure.identity.AzurePowerShellCredentialBuilder
 import com.azure.identity.ChainedTokenCredentialBuilder
 import com.azure.identity.EnvironmentCredentialBuilder
 import com.azure.identity.ManagedIdentityCredentialBuilder
+import com.azure.identity.WorkloadIdentityCredentialBuilder
 
 object AzureDevOpsCredentialsPlugin extends AutoPlugin {
   override def trigger = allRequirements
+
+  /** Azure DevOps resource scope for access tokens. */
+  private[sbt] val AzureDevOpsScope = "499b84ac-1321-427f-aa17-267ca6975798/.default"
+
+  /** System property to control Azure Identity SDK logging.
+    * Set to "off" during token acquisition to suppress expected [ERROR] messages
+    * from ChainedTokenCredential trying each provider in sequence. */
+  private val AzureIdentityLogProperty = "org.slf4j.simpleLogger.log.com.azure.identity"
+
+  /** Create a credential chain that prioritizes user credentials over managed identity.
+    * Order: AzureCli → AzurePowerShell → Environment → WorkloadIdentity → ManagedIdentity.
+    * This ensures user's az login or Azure PowerShell session is preferred over VM identity. */
+  private[sbt] def createCredential(): TokenCredential = {
+    new ChainedTokenCredentialBuilder()
+      .addLast(new AzureCliCredentialBuilder().build())
+      .addLast(new AzurePowerShellCredentialBuilder().build())
+      .addLast(new EnvironmentCredentialBuilder().build())
+      .addLast(new WorkloadIdentityCredentialBuilder().build())
+      .addLast(new ManagedIdentityCredentialBuilder().build())
+      .build()
+  }
 
   /** Extract organization name from Azure DevOps URL. Exposed for testing. */
   private[sbt] def getOrganization(uri: URI): Option[String] = {
@@ -198,17 +221,14 @@ object AzureDevOpsCredentialsPlugin extends AutoPlugin {
 
     private def getTokenImpl(): Option[String] = {
       log.debug("trying to create access token")
-      // Use ChainedTokenCredential with AzureCli first to prioritize user credentials
-      // over Managed Identity on Azure VMs. This matches the maven-azure-devops-credentials
-      // extension and ensures user's az login token is used instead of VM's MI token.
-      val credential = new ChainedTokenCredentialBuilder()
-        .addLast(new AzureCliCredentialBuilder().build())
-        .addLast(new EnvironmentCredentialBuilder().build())
-        .addLast(new ManagedIdentityCredentialBuilder().build())
-        .build()
-      // Restrict token to Azure DevOps. Using /.default suffix for v2 endpoint convention.
-      val request = new TokenRequestContext().addScopes("499b84ac-1321-427f-aa17-267ca6975798/.default")
+      // Suppress Azure Identity logging during token acquisition. ChainedTokenCredential
+      // logs [ERROR] for each provider that fails, which are expected failures — not all
+      // providers are available in all environments.
+      val previousLevel = Option(System.getProperty(AzureIdentityLogProperty))
+      System.setProperty(AzureIdentityLogProperty, "off")
       try {
+        val credential = createCredential()
+        val request = new TokenRequestContext().addScopes(AzureDevOpsScope)
         val token = credential.getToken(request).block()
         if (token != null) {
           log.debug("access token created")
@@ -222,6 +242,11 @@ object AzureDevOpsCredentialsPlugin extends AutoPlugin {
           log.warn(s"failed to get access token. Did you forget to run `az login`?")
           log.debug(e.toString())
           None
+      } finally {
+        previousLevel match {
+          case Some(level) => System.setProperty(AzureIdentityLogProperty, level)
+          case None => System.clearProperty(AzureIdentityLogProperty)
+        }
       }
     }
 

@@ -16,15 +16,10 @@
 package dev.chungmin.sbt
 
 import java.net.URI
+import java.util.Base64
 import org.scalatest.flatspec.AnyFlatSpec
 import org.scalatest.matchers.should.Matchers
 import org.scalatest.tagobjects.Slow
-
-import com.azure.core.credential.TokenRequestContext
-import com.azure.identity.AzureCliCredentialBuilder
-import com.azure.identity.ChainedTokenCredentialBuilder
-import com.azure.identity.EnvironmentCredentialBuilder
-import com.azure.identity.ManagedIdentityCredentialBuilder
 
 /**
  * Integration tests that require a real Azure DevOps endpoint and Azure login.
@@ -40,19 +35,30 @@ class AzureDevOpsCredentialsIntegrationSpec extends AnyFlatSpec with Matchers {
 
   val testUrl: Option[String] = sys.env.get("AZURE_DEVOPS_TEST_URL")
 
-  "Azure Identity" should "obtain an access token" taggedAs Slow in {
+  "Azure Identity" should "obtain a user access token (not MI token)" taggedAs Slow in {
     assume(testUrl.isDefined, "Set AZURE_DEVOPS_TEST_URL to run this test")
 
-    val credential = new ChainedTokenCredentialBuilder()
-      .addLast(new AzureCliCredentialBuilder().build())
-      .addLast(new EnvironmentCredentialBuilder().build())
-      .addLast(new ManagedIdentityCredentialBuilder().build())
-      .build()
-    val request = new TokenRequestContext().addScopes("499b84ac-1321-427f-aa17-267ca6975798/.default")
+    val credential = AzureDevOpsCredentialsPlugin.createCredential()
+    val request = new com.azure.core.credential.TokenRequestContext()
+      .addScopes(AzureDevOpsCredentialsPlugin.AzureDevOpsScope)
 
     val token = credential.getToken(request).block()
     token should not be null
-    token.getToken should not be empty
+    val tokenString = token.getToken
+    tokenString should not be empty
+
+    // Decode JWT to verify it's a user token (has UPN) not an MI service principal token.
+    // JWT format: header.payload.signature - we need the payload (middle part)
+    val parts = tokenString.split('.')
+    parts should have length 3
+
+    // Base64 decode the payload. JWT uses URL-safe base64 without padding.
+    val payloadBytes = Base64.getUrlDecoder.decode(parts(1))
+    val payload = new String(payloadBytes, "UTF-8")
+
+    // User tokens have "upn" (User Principal Name) claim; MI tokens do not.
+    // This proves we got the user's credential, not the VM's managed identity.
+    payload should include ("\"upn\":")
   }
 
   "getOrganization" should "extract org from user-provided URL" taggedAs Slow in {
