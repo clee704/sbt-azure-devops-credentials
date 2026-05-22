@@ -51,6 +51,39 @@ object AzureDevOpsCredentialsPlugin extends AutoPlugin {
     * from ChainedTokenCredential trying each provider in sequence. */
   private val AzureIdentityLogProperty = "org.slf4j.simpleLogger.log.com.azure.identity"
 
+  // Reference-counted suppression of the Azure-identity log-level system property.
+  // The first acquirer saves the previous value and sets the property to "off"; the
+  // last releaser restores it. Counted-set pattern so that multiple in-flight
+  // CredentialsBuilder instances share one suppression window without holding any
+  // lock during the (slow) Azure SDK call — only the brief save+set / restore
+  // boundaries serialize. Synchronized on this private monitor, not on the plugin
+  // object itself, so the lock can't be observed (or coincidentally taken) by
+  // outside code.
+  private val AzureIdentityLogSuppressionLock = new Object
+  private var suppressionCount: Int = 0
+  private var savedAzureIdentityLogLevel: Option[String] = None
+
+  private[sbt] def acquireAzureIdentityLogSuppression(): Unit =
+    AzureIdentityLogSuppressionLock.synchronized {
+      if (suppressionCount == 0) {
+        savedAzureIdentityLogLevel = Option(System.getProperty(AzureIdentityLogProperty))
+        System.setProperty(AzureIdentityLogProperty, "off")
+      }
+      suppressionCount += 1
+    }
+
+  private[sbt] def releaseAzureIdentityLogSuppression(): Unit =
+    AzureIdentityLogSuppressionLock.synchronized {
+      suppressionCount -= 1
+      if (suppressionCount == 0) {
+        savedAzureIdentityLogLevel match {
+          case Some(level) => System.setProperty(AzureIdentityLogProperty, level)
+          case None => System.clearProperty(AzureIdentityLogProperty)
+        }
+        savedAzureIdentityLogLevel = None
+      }
+    }
+
   /** Create a credential chain that prioritizes user credentials over managed identity.
     * Order: AzureCli → AzurePowerShell → Environment → WorkloadIdentity → ManagedIdentity.
     * This ensures user's az login or Azure PowerShell session is preferred over VM identity.
@@ -60,9 +93,9 @@ object AzureDevOpsCredentialsPlugin extends AutoPlugin {
     * all set to non-null AND non-empty values. Unlike DefaultAzureCredential,
     * it does NOT auto-read AZURE_CLIENT_ID / AZURE_TENANT_ID /
     * AZURE_FEDERATED_TOKEN_FILE from the environment, so we populate them
-    * ourselves. When those env vars are absent or empty (the common case on
-    * dev workstations) we skip the credential entirely; otherwise the chain
-    * assembly would fail before AzureCli is ever tried.
+    * ourselves. When those env vars are absent, empty, or whitespace-only (the
+    * common case on dev workstations) we skip the credential entirely; otherwise
+    * the chain assembly would fail before AzureCli is ever tried.
     *
     * The env parameter exists for testability — production callers should use
     * the default. */
@@ -72,9 +105,9 @@ object AzureDevOpsCredentialsPlugin extends AutoPlugin {
       .addLast(new AzurePowerShellCredentialBuilder().build())
       .addLast(new EnvironmentCredentialBuilder().build())
     for {
-      clientId  <- env.get("AZURE_CLIENT_ID").filter(_.nonEmpty)
-      tenantId  <- env.get("AZURE_TENANT_ID").filter(_.nonEmpty)
-      tokenFile <- env.get("AZURE_FEDERATED_TOKEN_FILE").filter(_.nonEmpty)
+      clientId  <- env.get("AZURE_CLIENT_ID").filter(_.trim.nonEmpty)
+      tenantId  <- env.get("AZURE_TENANT_ID").filter(_.trim.nonEmpty)
+      tokenFile <- env.get("AZURE_FEDERATED_TOKEN_FILE").filter(_.trim.nonEmpty)
     } {
       builder.addLast(
         new WorkloadIdentityCredentialBuilder()
@@ -272,35 +305,31 @@ object AzureDevOpsCredentialsPlugin extends AutoPlugin {
       // logs [ERROR] for each provider that fails, which are expected failures — not all
       // providers are available in all environments.
       //
-      // Lock is at object (singleton) scope, not `this`, because the system property is
-      // JVM-wide global state. Without this, two CredentialsBuilder instances on different
-      // threads (e.g. multi-project sbt builds resolving credentials in parallel) could
-      // interleave save/set/restore and leave the property pinned to "off" indefinitely.
-      AzureDevOpsCredentialsPlugin.synchronized {
-        val previousLevel = Option(System.getProperty(AzureIdentityLogProperty))
-        System.setProperty(AzureIdentityLogProperty, "off")
-        try {
-          val credential = newCredential()
-          val request = new TokenRequestContext().addScopes(AzureDevOpsScope)
-          val token = credential.getToken(request).block()
-          if (token != null) {
-            log.debug("access token created")
-            Some(token.getToken())
-          } else {
-            log.warn(s"failed to get access token (getToken() returned null)")
-            None
-          }
-        } catch {
-          case NonFatal(e) =>
-            log.warn(s"failed to get access token. Did you forget to run `az login`?")
-            log.debug(e.toString())
-            None
-        } finally {
-          previousLevel match {
-            case Some(level) => System.setProperty(AzureIdentityLogProperty, level)
-            case None => System.clearProperty(AzureIdentityLogProperty)
-          }
+      // The suppression is a JVM-wide system property (`AzureIdentityLogProperty`), so
+      // we coordinate via a counted-set on the plugin object: the first acquirer saves
+      // the previous value and sets the property to "off"; the last releaser restores
+      // it. The brief save+set / restore boundaries serialize across threads, but the
+      // SDK call itself runs without any plugin-level lock, so multi-project sbt builds
+      // can fetch tokens in parallel.
+      AzureDevOpsCredentialsPlugin.acquireAzureIdentityLogSuppression()
+      try {
+        val credential = newCredential()
+        val request = new TokenRequestContext().addScopes(AzureDevOpsScope)
+        val token = credential.getToken(request).block()
+        if (token != null) {
+          log.debug("access token created")
+          Some(token.getToken())
+        } else {
+          log.warn(s"failed to get access token (getToken() returned null)")
+          None
         }
+      } catch {
+        case NonFatal(e) =>
+          log.warn(s"failed to get access token. Did you forget to run `az login`?")
+          log.debug(e.toString())
+          None
+      } finally {
+        AzureDevOpsCredentialsPlugin.releaseAzureIdentityLogSuppression()
       }
     }
 

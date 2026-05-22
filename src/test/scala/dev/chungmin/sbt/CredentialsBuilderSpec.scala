@@ -19,6 +19,7 @@ import java.io.{BufferedWriter, File, OutputStreamWriter, PrintWriter}
 import java.net.{ServerSocket, URI}
 import java.nio.file.Files
 import java.time.OffsetDateTime
+import javax.net.ssl.SSLException
 
 import scala.util.control.NonFatal
 
@@ -361,9 +362,9 @@ class CredentialsBuilderSpec extends AnyFlatSpec with Matchers {
   }
 
   it should "restore the Azure-identity log level when concurrent CredentialsBuilder instances acquire tokens" in {
-    // Regression guard for the save/set/restore race: without a JVM-wide lock,
-    // two builders could observe each other's "off" mutation and leave the
-    // property pinned to "off" after both threads finish.
+    // Regression guard for the save/set/restore race: without a JVM-wide
+    // counted-set, two builders could observe each other's "off" mutation and
+    // leave the property pinned to "off" after both threads finish.
     val prop = "org.slf4j.simpleLogger.log.com.azure.identity"
     val original = Option(System.getProperty(prop))
     System.setProperty(prop, "initial")
@@ -378,6 +379,32 @@ class CredentialsBuilderSpec extends AnyFlatSpec with Matchers {
         t
       }
       threads.foreach(_.join())
+      System.getProperty(prop) shouldBe "initial"
+    } finally {
+      original match {
+        case Some(v) => System.setProperty(prop, v)
+        case None => System.clearProperty(prop)
+      }
+    }
+  }
+
+  it should "keep the Azure-identity log level pinned to 'off' across nested suppressions and only restore on the outermost release" in {
+    // Directly exercises the counted-set helpers to assert the invariant the
+    // 8-thread concurrency test relies on: inner acquire/release does NOT
+    // restore the property while an outer suppression is still in flight.
+    val prop = "org.slf4j.simpleLogger.log.com.azure.identity"
+    val original = Option(System.getProperty(prop))
+    System.setProperty(prop, "initial")
+    try {
+      AzureDevOpsCredentialsPlugin.acquireAzureIdentityLogSuppression()
+      System.getProperty(prop) shouldBe "off"
+      AzureDevOpsCredentialsPlugin.acquireAzureIdentityLogSuppression()
+      System.getProperty(prop) shouldBe "off"
+      AzureDevOpsCredentialsPlugin.releaseAzureIdentityLogSuppression()
+      // Inner release: still suppressed because outer is still in flight.
+      System.getProperty(prop) shouldBe "off"
+      AzureDevOpsCredentialsPlugin.releaseAzureIdentityLogSuppression()
+      // Outer release: property restored to the saved-at-first-acquire value.
       System.getProperty(prop) shouldBe "initial"
     } finally {
       original match {
@@ -502,14 +529,16 @@ class CredentialsBuilderSpec extends AnyFlatSpec with Matchers {
   }
 
   it should "wrap the socket with SSLSocketFactory when the scheme is https" in {
-    // Point an https URI at a plain-HTTP test server. The TLS handshake will
-    // fail (the server is speaking HTTP/1.1), but the wrap-with-SSL path on
-    // line ~128 still runs. The plugin propagates the error to getRealm which
-    // converts it to None — but here we just assert headRequestHeaders throws,
-    // which proves we entered the SSL wrap branch.
+    // Point an https URI at a plain-HTTP test server. The TLS handshake fails
+    // because the server immediately writes "HTTP/1.1 200 OK\r\n\r\n" — not a
+    // valid TLS record. Assert specifically on SSLException (rather than the
+    // broader `Exception`) so a future refactor that drops the SSLSocketFactory
+    // wrap entirely would surface as the test catching a non-SSL exception
+    // (e.g. parse failure on the plain HTTP response) instead of silently
+    // passing on whatever generic throwable happened.
     withRawHeadServer("HTTP/1.1 200 OK\r\n\r\n") { (host, port) =>
       val uri = new URI(s"https://$host:$port/")
-      an[Exception] should be thrownBy AzureDevOpsCredentialsPlugin.headRequestHeaders(uri)
+      an[SSLException] should be thrownBy AzureDevOpsCredentialsPlugin.headRequestHeaders(uri)
     }
   }
 

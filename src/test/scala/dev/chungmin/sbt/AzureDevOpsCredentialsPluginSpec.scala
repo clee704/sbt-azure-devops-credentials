@@ -210,13 +210,27 @@ class AzureDevOpsCredentialsPluginSpec extends AnyFlatSpec with Matchers {
 
   it should "build a chain without throwing when only some AAD env vars are empty" in {
     // Mixed case: AZURE_CLIENT_ID is empty but the other two are set. Without
-    // the per-value .filter(_.nonEmpty), the for-comprehension would still
+    // the per-value .filter(_.trim.nonEmpty), the for-comprehension would still
     // succeed (Some("") satisfies the comprehension) and the builder's
     // .clientId("") + .build() would throw.
     val env = Map(
       "AZURE_CLIENT_ID" -> "",
       "AZURE_TENANT_ID" -> "00000000-0000-0000-0000-000000000000",
       "AZURE_FEDERATED_TOKEN_FILE" -> "/tmp/nonexistent-federated-token"
+    )
+    val cred = AzureDevOpsCredentialsPlugin.createCredential(env)
+    cred should not be null
+  }
+
+  it should "build a chain without throwing when AAD env vars are whitespace-only" in {
+    // The Azure SDK's `Strings.isNullOrEmpty` only checks null + empty; whitespace-
+    // only values like "  " or "\t" pass validation and end up in the credential
+    // as garbage. `.trim.nonEmpty` (instead of just `.nonEmpty`) skips them, which
+    // is defense-in-depth against a partially-broken env-template substitution.
+    val env = Map(
+      "AZURE_CLIENT_ID" -> "  ",
+      "AZURE_TENANT_ID" -> "\t",
+      "AZURE_FEDERATED_TOKEN_FILE" -> "   \n"
     )
     val cred = AzureDevOpsCredentialsPlugin.createCredential(env)
     cred should not be null
