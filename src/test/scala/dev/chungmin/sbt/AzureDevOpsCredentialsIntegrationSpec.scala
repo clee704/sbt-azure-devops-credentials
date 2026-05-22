@@ -21,7 +21,10 @@ import org.scalatest.matchers.should.Matchers
 import org.scalatest.tagobjects.Slow
 
 import com.azure.core.credential.TokenRequestContext
-import com.azure.identity.DefaultAzureCredentialBuilder
+import com.azure.identity.AzureCliCredentialBuilder
+import com.azure.identity.ChainedTokenCredentialBuilder
+import com.azure.identity.EnvironmentCredentialBuilder
+import com.azure.identity.ManagedIdentityCredentialBuilder
 
 /**
  * Integration tests that require a real Azure DevOps endpoint and Azure login.
@@ -40,8 +43,12 @@ class AzureDevOpsCredentialsIntegrationSpec extends AnyFlatSpec with Matchers {
   "Azure Identity" should "obtain an access token" taggedAs Slow in {
     assume(testUrl.isDefined, "Set AZURE_DEVOPS_TEST_URL to run this test")
 
-    val credential = new DefaultAzureCredentialBuilder().build()
-    val request = new TokenRequestContext().addScopes("499b84ac-1321-427f-aa17-267ca6975798")
+    val credential = new ChainedTokenCredentialBuilder()
+      .addLast(new AzureCliCredentialBuilder().build())
+      .addLast(new EnvironmentCredentialBuilder().build())
+      .addLast(new ManagedIdentityCredentialBuilder().build())
+      .build()
+    val request = new TokenRequestContext().addScopes("499b84ac-1321-427f-aa17-267ca6975798/.default")
 
     val token = credential.getToken(request).block()
     token should not be null

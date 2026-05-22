@@ -31,7 +31,10 @@ import lmcoursier.CoursierConfiguration
 import lmcoursier.definitions.Authentication
 
 import com.azure.core.credential.TokenRequestContext
-import com.azure.identity.DefaultAzureCredentialBuilder
+import com.azure.identity.AzureCliCredentialBuilder
+import com.azure.identity.ChainedTokenCredentialBuilder
+import com.azure.identity.EnvironmentCredentialBuilder
+import com.azure.identity.ManagedIdentityCredentialBuilder
 
 object AzureDevOpsCredentialsPlugin extends AutoPlugin {
   override def trigger = allRequirements
@@ -195,9 +198,16 @@ object AzureDevOpsCredentialsPlugin extends AutoPlugin {
 
     private def getTokenImpl(): Option[String] = {
       log.debug("trying to create access token")
-      val credential = new DefaultAzureCredentialBuilder().build()
-      // Restrict token to Azure DevOps
-      val request = new TokenRequestContext().addScopes("499b84ac-1321-427f-aa17-267ca6975798")
+      // Use ChainedTokenCredential with AzureCli first to prioritize user credentials
+      // over Managed Identity on Azure VMs. This matches the maven-azure-devops-credentials
+      // extension and ensures user's az login token is used instead of VM's MI token.
+      val credential = new ChainedTokenCredentialBuilder()
+        .addLast(new AzureCliCredentialBuilder().build())
+        .addLast(new EnvironmentCredentialBuilder().build())
+        .addLast(new ManagedIdentityCredentialBuilder().build())
+        .build()
+      // Restrict token to Azure DevOps. Using /.default suffix for v2 endpoint convention.
+      val request = new TokenRequestContext().addScopes("499b84ac-1321-427f-aa17-267ca6975798/.default")
       try {
         val token = credential.getToken(request).block()
         if (token != null) {
