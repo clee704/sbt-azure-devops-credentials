@@ -43,27 +43,79 @@ import com.azure.identity.{
 object AzureDevOpsCredentialsPlugin extends AutoPlugin {
   override def trigger = allRequirements
 
+  // NOTE on the package-private modifier used throughout this file:
+  // `private[chungmin]` (not `private[sbt]`) is deliberate. The plugin's
+  // package is `dev.chungmin.sbt`, so Scala's enclosing-package resolution
+  // for `private[X]` matches the leaf segment of that package — i.e.
+  // `private[sbt]` here would be `private[`dev.chungmin.sbt`]`, NOT
+  // package-private to the global `sbt` ecosystem (which is not an
+  // enclosing scope). `private[chungmin]` resolves unambiguously to
+  // `dev.chungmin.*` — a strictly clearer way to express "visible to test
+  // code in this package but not part of the user-facing API" without the
+  // parse hazard of looking exposed to all of sbt.
+
   /** Azure DevOps resource scope for access tokens. */
-  private[sbt] val AzureDevOpsScope = "499b84ac-1321-427f-aa17-267ca6975798/.default"
+  private[chungmin] val AzureDevOpsScope = "499b84ac-1321-427f-aa17-267ca6975798/.default"
 
   /** System property to control Azure Identity SDK logging.
     * Set to "off" during token acquisition to suppress expected [ERROR] messages
     * from ChainedTokenCredential trying each provider in sequence. */
   private val AzureIdentityLogProperty = "org.slf4j.simpleLogger.log.com.azure.identity"
 
-  // Reference-counted suppression of the Azure-identity log-level system property.
-  // The first acquirer saves the previous value and sets the property to "off"; the
-  // last releaser restores it. Counted-set pattern so that multiple in-flight
-  // CredentialsBuilder instances share one suppression window without holding any
-  // lock during the (slow) Azure SDK call — only the brief save+set / restore
-  // boundaries serialize. Synchronized on this private monitor, not on the plugin
-  // object itself, so the lock can't be observed (or coincidentally taken) by
-  // outside code.
+  /** Set [[AzureIdentityLogProperty]] to `"off"` at plugin classloading if it
+    * isn't already set. Defends against the SLF4J SimpleLogger caching
+    * pattern: SimpleLogger reads the per-logger level once at logger
+    * instantiation time and caches it for the JVM's life. A later
+    * `System.setProperty(prop, "off")` only affects loggers that haven't
+    * been initialized yet; loggers already cached at INFO stay at INFO
+    * regardless. If anything else in the JVM (another sbt plugin pulling
+    * in azure-* transitively, an sbt server pre-classloading dependencies,
+    * a `console` invocation, a `Class.forName` in some diagnostic helper)
+    * touches a `com.azure.identity` logger BEFORE the plugin's first
+    * `getTokenImpl()` call, the per-call counted-set suppression becomes a
+    * silent no-op for the rest of the run.
+    *
+    * Running this in the plugin object's static-init block makes the
+    * suppression effective for the typical case "plugin classloads before
+    * azure-identity" — which holds in sbt because the AutoPlugin discovery
+    * generally precedes any user setting that touches azure-* directly.
+    * The case "azure-identity classloads before the plugin" (e.g. an
+    * upstream plugin already runs an `az` call from a setting) is
+    * unfixable from inside the plugin; the user should set
+    * `-Dorg.slf4j.simpleLogger.log.com.azure.identity=off` via JVM args.
+    *
+    * Respects a pre-existing user value so a developer who explicitly sets
+    * the property to `"debug"` for diagnostics sees their override. */
+  private[chungmin] def initializeAzureIdentityLogSuppression(): Unit = {
+    if (System.getProperty(AzureIdentityLogProperty) == null) {
+      System.setProperty(AzureIdentityLogProperty, "off")
+    }
+  }
+
+  initializeAzureIdentityLogSuppression()
+
+  // Reference-counted suppression of the Azure-identity log-level system
+  // property. The first acquirer saves the previous value and sets the
+  // property to "off"; the last releaser restores it. Counted-set pattern
+  // so that multiple in-flight CredentialsBuilder instances share one
+  // suppression window without holding any lock during the (slow) Azure
+  // SDK call — only the brief save+set / restore boundaries serialize.
+  //
+  // Synchronized on this private monitor, not on the plugin object itself,
+  // so the lock can't be observed (or coincidentally taken) by outside
+  // code.
+  //
+  // Important contract: the counted-set only flips the PROPERTY VALUE.
+  // SimpleLogger caches the level at logger init, so this is only fully
+  // effective if no com.azure.identity logger has been initialized yet
+  // when the first acquire runs. The static initializer above
+  // ([[initializeAzureIdentityLogSuppression]]) makes that precondition
+  // hold in the typical case (plugin classloads before azure-identity).
   private val AzureIdentityLogSuppressionLock = new Object
   private var suppressionCount: Int = 0
   private var savedAzureIdentityLogLevel: Option[String] = None
 
-  private[sbt] def acquireAzureIdentityLogSuppression(): Unit =
+  private[chungmin] def acquireAzureIdentityLogSuppression(): Unit =
     AzureIdentityLogSuppressionLock.synchronized {
       if (suppressionCount == 0) {
         savedAzureIdentityLogLevel = Option(System.getProperty(AzureIdentityLogProperty))
@@ -72,8 +124,18 @@ object AzureDevOpsCredentialsPlugin extends AutoPlugin {
       suppressionCount += 1
     }
 
-  private[sbt] def releaseAzureIdentityLogSuppression(): Unit =
+  private[chungmin] def releaseAzureIdentityLogSuppression(): Unit =
     AzureIdentityLogSuppressionLock.synchronized {
+      // Fail fast at the actual bad caller: an unmatched release would
+      // drop the counter to -1, and the next acquire would see
+      // suppressionCount == 0 is false (it's -1) and skip the save+set,
+      // silently disabling the suppression for the rest of the JVM run.
+      // The drift looks healthy from the outside (count returns to 0
+      // again after one more acquire/release pair), so without this
+      // require() it'd go undetected in production.
+      require(
+        suppressionCount > 0,
+        "releaseAzureIdentityLogSuppression called without a matching acquire")
       suppressionCount -= 1
       if (suppressionCount == 0) {
         savedAzureIdentityLogLevel match {
@@ -91,9 +153,9 @@ object AzureDevOpsCredentialsPlugin extends AutoPlugin {
     * that leaks an unmatched acquire would otherwise manifest as a confusing
     * failure in a downstream test — the symptom (a wrong property value)
     * surfaces several tests away from the leak source. Exposed as
-    * `private[sbt]` so test code can assert `count == 0` between tests and
-    * pin any future leak to its actual source. */
-  private[sbt] def suppressionCountForTesting: Int =
+    * `private[chungmin]` so test code can assert `count == 0` between tests
+    * and pin any future leak to its actual source. */
+  private[chungmin] def suppressionCountForTesting: Int =
     AzureIdentityLogSuppressionLock.synchronized { suppressionCount }
 
   /** Normalize an env-var value: trim surrounding whitespace and return
@@ -102,53 +164,70 @@ object AzureDevOpsCredentialsPlugin extends AutoPlugin {
     * behavior is directly unit-testable (verifying via [[createCredential]]
     * alone would be tautological — the SDK builder accepts padded values, so
     * a chain-assembly assertion doesn't prove the trim ran). */
-  private[sbt] def envValue(env: Map[String, String], key: String): Option[String] =
+  private[chungmin] def envValue(env: Map[String, String], key: String): Option[String] =
     env.get(key).map(_.trim).filter(_.nonEmpty)
 
-  /** Create a credential chain that prioritizes user credentials over managed identity.
-    * Order: AzureCli → AzurePowerShell → Environment → WorkloadIdentity → ManagedIdentity.
-    * This ensures user's az login or Azure PowerShell session is preferred over VM identity.
+  /** Build the ordered list of credential providers that make up the
+    * Azure DevOps token chain. Order: AzureCli → AzurePowerShell →
+    * Environment → WorkloadIdentity (when its env vars are present) →
+    * ManagedIdentity. AzureCli first is the v0.0.8 motivation — on dev
+    * workstations with both `az login` and an ambient ManagedIdentity
+    * (e.g. inside an Azure VM), the user's `az login` session should win.
     *
-    * WorkloadIdentityCredentialBuilder.build() validates eagerly and throws
-    * IllegalArgumentException unless its clientId / tenantId / tokenFilePath are
-    * all set to non-null AND non-empty values. Unlike DefaultAzureCredential,
-    * it does NOT auto-read AZURE_CLIENT_ID / AZURE_TENANT_ID /
-    * AZURE_FEDERATED_TOKEN_FILE from the environment, so we populate them
-    * ourselves via [[envValue]]. When those env vars are absent, empty, or
-    * whitespace-only (the common case on dev workstations) we skip the
-    * credential entirely; otherwise the chain assembly would fail before
-    * AzureCli is ever tried. Padded values (e.g. a trailing newline from a
-    * broken env-template substitution) are trimmed before reaching the SDK,
-    * since the SDK accepts them at build time but they'd fail at getToken
-    * time and add noise to the chain.
+    * Exposed for testability so the chain *order* is directly assertable;
+    * [[ChainedTokenCredential]] doesn't expose its provider list, so a
+    * test on [[createCredential]]'s return value alone could only verify
+    * "the chain doesn't throw", not "AzureCli runs first" — which is the
+    * actual invariant the v0.0.8 fix relies on.
     *
-    * The env parameter exists for testability — production callers should use
-    * the default. */
-  private[sbt] def createCredential(env: Map[String, String] = sys.env): TokenCredential = {
-    val builder = new ChainedTokenCredentialBuilder()
-      .addLast(new AzureCliCredentialBuilder().build())
-      .addLast(new AzurePowerShellCredentialBuilder().build())
-      .addLast(new EnvironmentCredentialBuilder().build())
+    * WorkloadIdentityCredentialBuilder.build() validates eagerly and
+    * throws IllegalArgumentException unless its clientId / tenantId /
+    * tokenFilePath are all set to non-null AND non-empty values. Unlike
+    * DefaultAzureCredential, it does NOT auto-read AZURE_CLIENT_ID /
+    * AZURE_TENANT_ID / AZURE_FEDERATED_TOKEN_FILE from the environment,
+    * so we populate them ourselves via [[envValue]]. When those env vars
+    * are absent, empty, or whitespace-only (the common case on dev
+    * workstations) we skip the credential entirely; otherwise the chain
+    * assembly would fail before AzureCli is ever tried. Padded values
+    * (e.g. a trailing newline from a broken env-template substitution)
+    * are trimmed by [[envValue]] before reaching the SDK, since the SDK
+    * accepts them at build time but they'd fail at getToken time and add
+    * noise to the chain.
+    *
+    * The env parameter exists for testability — production callers should
+    * use the default. */
+  private[chungmin] def credentialProviders(
+      env: Map[String, String] = sys.env): Seq[TokenCredential] = {
+    val providers = scala.collection.mutable.ListBuffer.empty[TokenCredential]
+    providers += new AzureCliCredentialBuilder().build()
+    providers += new AzurePowerShellCredentialBuilder().build()
+    providers += new EnvironmentCredentialBuilder().build()
     for {
       clientId  <- envValue(env, "AZURE_CLIENT_ID")
       tenantId  <- envValue(env, "AZURE_TENANT_ID")
       tokenFile <- envValue(env, "AZURE_FEDERATED_TOKEN_FILE")
     } {
-      builder.addLast(
-        new WorkloadIdentityCredentialBuilder()
-          .clientId(clientId)
-          .tenantId(tenantId)
-          .tokenFilePath(tokenFile)
-          .build()
-      )
+      providers += new WorkloadIdentityCredentialBuilder()
+        .clientId(clientId)
+        .tenantId(tenantId)
+        .tokenFilePath(tokenFile)
+        .build()
     }
-    builder
-      .addLast(new ManagedIdentityCredentialBuilder().build())
-      .build()
+    providers += new ManagedIdentityCredentialBuilder().build()
+    providers.toList
+  }
+
+  /** Create the [[ChainedTokenCredential]] used at token-acquisition time.
+    * Thin wrapper over [[credentialProviders]] that wires the seq into a
+    * [[ChainedTokenCredentialBuilder]]. */
+  private[chungmin] def createCredential(env: Map[String, String] = sys.env): TokenCredential = {
+    val builder = new ChainedTokenCredentialBuilder()
+    credentialProviders(env).foreach(builder.addLast)
+    builder.build()
   }
 
   /** Extract organization name from Azure DevOps URL. Exposed for testing. */
-  private[sbt] def getOrganization(uri: URI): Option[String] = {
+  private[chungmin] def getOrganization(uri: URI): Option[String] = {
     val host = uri.getHost
     if (host == null) {
       None
@@ -164,7 +243,7 @@ object AzureDevOpsCredentialsPlugin extends AutoPlugin {
   }
 
   /** Check if host is an Azure DevOps package feed. Exposed for testing. */
-  private[sbt] def isAzureDevOpsHost(host: String): Boolean = {
+  private[chungmin] def isAzureDevOpsHost(host: String): Boolean = {
     host != null && (host.endsWith("pkgs.visualstudio.com") || host == "pkgs.dev.azure.com")
   }
 
@@ -173,7 +252,7 @@ object AzureDevOpsCredentialsPlugin extends AutoPlugin {
     * exercising it through [[headRequestHeaders]] would require an actual socket
     * round-trip and only verifies behavior tautologically (any port choice fails
     * the same way against an unresponsive address). */
-  private[sbt] def defaultPort(uri: URI): Int =
+  private[chungmin] def defaultPort(uri: URI): Int =
     if (uri.getPort >= 0) uri.getPort
     else if (uri.getScheme == "https") 443
     else 80
@@ -183,7 +262,7 @@ object AzureDevOpsCredentialsPlugin extends AutoPlugin {
     * Uses a raw socket instead of HttpURLConnection to avoid triggering
     * sbt's global IvyAuthenticator, which logs spurious "Unable to find
     * credentials" error messages when the server responds with 401. */
-  private[sbt] def headRequestHeaders(uri: URI): Seq[(String, String)] = {
+  private[chungmin] def headRequestHeaders(uri: URI): Seq[(String, String)] = {
     val host = uri.getHost
     val port = defaultPort(uri)
     val path = Option(uri.getRawPath).filter(_.nonEmpty).getOrElse("/")
@@ -398,7 +477,7 @@ object AzureDevOpsCredentialsPlugin extends AutoPlugin {
   }
 
   // Fix for https://github.com/coursier/coursier/issues/1649
-  private[sbt] def updateCoursierConf(
+  private[chungmin] def updateCoursierConf(
       conf: CoursierConfiguration,
       resolvers: Seq[Resolver],
       credentials: Seq[Credentials]) = {

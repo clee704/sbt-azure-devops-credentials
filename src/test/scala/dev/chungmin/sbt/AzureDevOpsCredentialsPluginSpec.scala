@@ -253,6 +253,44 @@ class AzureDevOpsCredentialsPluginSpec extends AnyFlatSpec with Matchers {
     cred should not be null
   }
 
+  "credentialProviders" should "place AzureCli first and ManagedIdentity last when AAD env vars are unset" in {
+    // Pins the v0.0.8 chain order: on dev workstations with no AAD env vars,
+    // AzureCli must be tried first (the v0.0.8 motivation), and ManagedIdentity
+    // must be the fallback for VM-resident builds. A future refactor that
+    // swaps the .addLast calls would still pass every other regression test
+    // because they all assert on "chain assembly doesn't throw" rather than
+    // on provider ordering — but it would silently regress the original bug
+    // (user's `az login` ignored in favor of the VM's managed identity).
+    val providers = AzureDevOpsCredentialsPlugin.credentialProviders(Map.empty)
+    providers.map(_.getClass.getSimpleName) shouldBe Seq(
+      "AzureCliCredential",
+      "AzurePowerShellCredential",
+      "EnvironmentCredential",
+      "ManagedIdentityCredential"
+    )
+  }
+
+  it should "insert WorkloadIdentity between EnvironmentCredential and ManagedIdentity when AAD env vars are set" in {
+    // Position-sensitive: WorkloadIdentity should run AFTER user-credential
+    // providers (AzureCli / PowerShell / Environment) so an interactive
+    // developer session wins over a partially-configured workload-identity
+    // setup, but BEFORE ManagedIdentity so a k8s pod with workload-identity
+    // env vars set doesn't fall through to a VM managed identity.
+    val env = Map(
+      "AZURE_CLIENT_ID" -> "00000000-0000-0000-0000-000000000000",
+      "AZURE_TENANT_ID" -> "11111111-1111-1111-1111-111111111111",
+      "AZURE_FEDERATED_TOKEN_FILE" -> "/tmp/nonexistent-federated-token"
+    )
+    val providers = AzureDevOpsCredentialsPlugin.credentialProviders(env)
+    providers.map(_.getClass.getSimpleName) shouldBe Seq(
+      "AzureCliCredential",
+      "AzurePowerShellCredential",
+      "EnvironmentCredential",
+      "WorkloadIdentityCredential",
+      "ManagedIdentityCredential"
+    )
+  }
+
   "envValue" should "return Some(trimmed) for padded values" in {
     val env = Map("X" -> "  abc  ", "Y" -> "\tabc\n", "Z" -> "abc")
     AzureDevOpsCredentialsPlugin.envValue(env, "X") shouldBe Some("abc")
@@ -267,5 +305,41 @@ class AzureDevOpsCredentialsPluginSpec extends AnyFlatSpec with Matchers {
     AzureDevOpsCredentialsPlugin.envValue(env, "tabs") shouldBe None
     AzureDevOpsCredentialsPlugin.envValue(env, "mixed") shouldBe None
     AzureDevOpsCredentialsPlugin.envValue(env, "missing") shouldBe None
+  }
+
+  "initializeAzureIdentityLogSuppression" should "set the property to 'off' when unset" in {
+    // Direct exercise of the static-init helper. The block runs once at
+    // plugin classloading; re-invoking it from a test (with the property
+    // explicitly cleared first) verifies the unset->"off" path.
+    val prop = "org.slf4j.simpleLogger.log.com.azure.identity"
+    val original = Option(System.getProperty(prop))
+    System.clearProperty(prop)
+    try {
+      AzureDevOpsCredentialsPlugin.initializeAzureIdentityLogSuppression()
+      System.getProperty(prop) shouldBe "off"
+    } finally {
+      original match {
+        case Some(v) => System.setProperty(prop, v)
+        case None => System.clearProperty(prop)
+      }
+    }
+  }
+
+  it should "not override a pre-existing value" in {
+    // A developer who sets the property explicitly (e.g. -Dorg.slf4j.simpleLogger.log.com.azure.identity=debug
+    // for diagnostics) should see their override survive plugin classloading.
+    // Verifies the "no-op when set" branch of the static-init helper.
+    val prop = "org.slf4j.simpleLogger.log.com.azure.identity"
+    val original = Option(System.getProperty(prop))
+    System.setProperty(prop, "debug")
+    try {
+      AzureDevOpsCredentialsPlugin.initializeAzureIdentityLogSuppression()
+      System.getProperty(prop) shouldBe "debug"
+    } finally {
+      original match {
+        case Some(v) => System.setProperty(prop, v)
+        case None => System.clearProperty(prop)
+      }
+    }
   }
 }

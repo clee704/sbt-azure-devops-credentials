@@ -471,6 +471,24 @@ class CredentialsBuilderSpec extends AnyFlatSpec with Matchers with BeforeAndAft
     }
   }
 
+  it should "throw IllegalArgumentException when release is called without a matching acquire" in {
+    // Regression guard for the unbalanced-release silent-corruption mode:
+    // without the `require(suppressionCount > 0, ...)` in release, an
+    // unmatched release would decrement the counter to -1; the next acquire
+    // would see suppressionCount == 0 is false (it's -1), skip the save+set,
+    // and just bump to 0. The suppression then becomes a silent no-op for the
+    // rest of the JVM run — counter looks healthy from the outside (returns
+    // to 0 again on the next acquire/release pair) but the property is never
+    // saved or restored. `require` makes the failure mode loud at the actual
+    // bad caller instead.
+    an[IllegalArgumentException] should be thrownBy {
+      AzureDevOpsCredentialsPlugin.releaseAzureIdentityLogSuppression()
+    }
+    // Counter remains at 0 because `require` throws before any mutation.
+    // (Also cross-checked by the per-test BeforeAndAfter `after` hook.)
+    AzureDevOpsCredentialsPlugin.suppressionCountForTesting shouldBe 0
+  }
+
   // ─── updateCoursierConf ─────────────────────────────────────────────────
 
   "updateCoursierConf" should "add authentication for MavenRepos with matching credentials" in {
