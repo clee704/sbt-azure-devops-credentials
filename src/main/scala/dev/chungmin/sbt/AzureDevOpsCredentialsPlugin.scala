@@ -53,13 +53,37 @@ object AzureDevOpsCredentialsPlugin extends AutoPlugin {
 
   /** Create a credential chain that prioritizes user credentials over managed identity.
     * Order: AzureCli → AzurePowerShell → Environment → WorkloadIdentity → ManagedIdentity.
-    * This ensures user's az login or Azure PowerShell session is preferred over VM identity. */
-  private[sbt] def createCredential(): TokenCredential = {
-    new ChainedTokenCredentialBuilder()
+    * This ensures user's az login or Azure PowerShell session is preferred over VM identity.
+    *
+    * WorkloadIdentityCredentialBuilder.build() validates eagerly and throws
+    * IllegalArgumentException unless its clientId / tenantId / tokenFilePath are
+    * all set. Unlike DefaultAzureCredential, it does NOT auto-read AZURE_CLIENT_ID
+    * / AZURE_TENANT_ID / AZURE_FEDERATED_TOKEN_FILE from the environment, so we
+    * populate them ourselves. When those env vars are absent (the common case on
+    * dev workstations) we skip the credential entirely; otherwise the chain
+    * assembly would fail before AzureCli is ever tried.
+    *
+    * The env parameter exists for testability — production callers should use
+    * the default. */
+  private[sbt] def createCredential(env: Map[String, String] = sys.env): TokenCredential = {
+    val builder = new ChainedTokenCredentialBuilder()
       .addLast(new AzureCliCredentialBuilder().build())
       .addLast(new AzurePowerShellCredentialBuilder().build())
       .addLast(new EnvironmentCredentialBuilder().build())
-      .addLast(new WorkloadIdentityCredentialBuilder().build())
+    for {
+      clientId <- env.get("AZURE_CLIENT_ID")
+      tenantId <- env.get("AZURE_TENANT_ID")
+      tokenFile <- env.get("AZURE_FEDERATED_TOKEN_FILE")
+    } {
+      builder.addLast(
+        new WorkloadIdentityCredentialBuilder()
+          .clientId(clientId)
+          .tenantId(tenantId)
+          .tokenFilePath(tokenFile)
+          .build()
+      )
+    }
+    builder
       .addLast(new ManagedIdentityCredentialBuilder().build())
       .build()
   }

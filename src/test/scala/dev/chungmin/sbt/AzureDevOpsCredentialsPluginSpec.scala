@@ -168,4 +168,26 @@ class AzureDevOpsCredentialsPluginSpec extends AnyFlatSpec with Matchers {
       server.close()
     }
   }
+
+  "createCredential" should "build a chain without throwing when no AAD env vars are set" in {
+    // Regression test for v0.0.8: WorkloadIdentityCredentialBuilder.build()
+    // throws IllegalArgumentException when AZURE_CLIENT_ID / AZURE_TENANT_ID /
+    // AZURE_FEDERATED_TOKEN_FILE are unset. Because that .build() is called
+    // eagerly during chain assembly, the entire chain construction failed before
+    // AzureCli was ever tried — leaving developer workstations (which don't
+    // normally have those env vars set) with a plugin that always reported
+    // "failed to get access token. Did you forget to run `az login`?".
+    val cred = AzureDevOpsCredentialsPlugin.createCredential(Map.empty)
+    cred should not be null
+  }
+
+  it should "build a chain without throwing when workload-identity env vars are set" in {
+    val env = Map(
+      "AZURE_CLIENT_ID" -> "00000000-0000-0000-0000-000000000000",
+      "AZURE_TENANT_ID" -> "00000000-0000-0000-0000-000000000000",
+      "AZURE_FEDERATED_TOKEN_FILE" -> "/tmp/nonexistent-federated-token"
+    )
+    val cred = AzureDevOpsCredentialsPlugin.createCredential(env)
+    cred should not be null
+  }
 }
