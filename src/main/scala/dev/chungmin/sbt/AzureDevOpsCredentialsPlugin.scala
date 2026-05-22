@@ -110,6 +110,16 @@ object AzureDevOpsCredentialsPlugin extends AutoPlugin {
     host != null && (host.endsWith("pkgs.visualstudio.com") || host == "pkgs.dev.azure.com")
   }
 
+  /** Return the explicit port from `uri`, or the scheme default (443 for `https`,
+    * 80 for everything else). Extracted as a pure helper for direct unit testing —
+    * exercising it through [[headRequestHeaders]] would require an actual socket
+    * round-trip and only verifies behavior tautologically (any port choice fails
+    * the same way against an unresponsive address). */
+  private[sbt] def defaultPort(uri: URI): Int =
+    if (uri.getPort >= 0) uri.getPort
+    else if (uri.getScheme == "https") 443
+    else 80
+
   /** Send an unauthenticated HEAD request and return the response headers.
     *
     * Uses a raw socket instead of HttpURLConnection to avoid triggering
@@ -117,8 +127,7 @@ object AzureDevOpsCredentialsPlugin extends AutoPlugin {
     * credentials" error messages when the server responds with 401. */
   private[sbt] def headRequestHeaders(uri: URI): Seq[(String, String)] = {
     val host = uri.getHost
-    val port = if (uri.getPort >= 0) uri.getPort else
-      (if (uri.getScheme == "https") 443 else 80)
+    val port = defaultPort(uri)
     val path = Option(uri.getRawPath).filter(_.nonEmpty).getOrElse("/")
     val rawSocket = new Socket()
     try {

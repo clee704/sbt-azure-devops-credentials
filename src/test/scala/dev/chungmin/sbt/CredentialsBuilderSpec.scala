@@ -513,20 +513,24 @@ class CredentialsBuilderSpec extends AnyFlatSpec with Matchers {
     }
   }
 
-  it should "default to port 80 for http URIs with no explicit port" in {
-    // Hit a TCP server we just started, but address it via a URI that has no
-    // explicit port. We can't bind port 80 in CI, so instead we use 127.0.0.2
-    // (a localhost alias that is guaranteed unreachable) — the connect attempt
-    // exercises the "scheme == http, no port -> 80" branch even though the
-    // actual TCP connect fails.
-    val uri = new URI("http://127.0.0.2/")
-    // Either the connect times out or it's refused; either way the function
-    // throws, which is what we want to assert.
-    an[Exception] should be thrownBy AzureDevOpsCredentialsPlugin.headRequestHeaders(uri)
+  // ─── defaultPort (pure helper — no socket) ──────────────────────────────
+
+  "defaultPort" should "return the explicit port when set" in {
+    AzureDevOpsCredentialsPlugin.defaultPort(new URI("http://example.com:8080/")) shouldBe 8080
+    AzureDevOpsCredentialsPlugin.defaultPort(new URI("https://example.com:8443/")) shouldBe 8443
   }
 
-  it should "default to port 443 for https URIs with no explicit port" in {
-    val uri = new URI("https://127.0.0.2/")
-    an[Exception] should be thrownBy AzureDevOpsCredentialsPlugin.headRequestHeaders(uri)
+  it should "default to 80 for http URIs with no explicit port" in {
+    AzureDevOpsCredentialsPlugin.defaultPort(new URI("http://example.com/")) shouldBe 80
+  }
+
+  it should "default to 443 for https URIs with no explicit port" in {
+    AzureDevOpsCredentialsPlugin.defaultPort(new URI("https://example.com/")) shouldBe 443
+  }
+
+  it should "default to 80 for non-https schemes with no explicit port" in {
+    // The branch is "https -> 443 else 80"; assert the else path on a non-https,
+    // non-http scheme (e.g. ftp) actually returns 80, not 443.
+    AzureDevOpsCredentialsPlugin.defaultPort(new URI("ftp://example.com/")) shouldBe 80
   }
 }
