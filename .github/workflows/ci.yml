@@ -20,6 +20,16 @@ jobs:
           distribution: temurin
           java-version: ${{ matrix.java }}
           cache: sbt
+      # `cache: sbt` above covers ~/.sbt and ~/.ivy2/cache but not the Coursier cache,
+      # which is where sbt 1.3+ resolves most artifacts (azure-identity + transitive
+      # netty/reactor, scalatest, scoverage runtime, etc.). Cache it explicitly so the
+      # JDK matrix doesn't re-download on every job.
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cache/coursier
+          key: coursier-${{ runner.os }}-${{ hashFiles('build.sbt', 'project/plugins.sbt', 'project/build.properties') }}
+          restore-keys: |
+            coursier-${{ runner.os }}-
       - uses: sbt/setup-sbt@v1
       - run: sbt -batch clean coverage test coverageReport
       - name: Coverage summary
@@ -29,10 +39,13 @@ jobs:
         run: |
           python3 - <<'EOF'
           import xml.etree.ElementTree as ET, glob, os
-          reports = glob.glob('target/scala-*/sbt-*/scoverage-report/scoverage.xml')
+          # Sort for deterministic selection when multiple reports exist (e.g. future
+          # cross-sbt-version builds). Today this glob matches exactly one file.
+          reports = sorted(glob.glob('target/scala-*/sbt-*/scoverage-report/scoverage.xml'))
           if not reports:
               exit(0)
-          root = ET.parse(reports[0]).getroot()
+          report = reports[0]
+          root = ET.parse(report).getroot()
           a = root.attrib
           stmt_total = int(a.get('statement-count', 0))
           stmt_done  = int(a.get('statements-invoked', 0))
@@ -43,7 +56,13 @@ jobs:
               f"| Branch    | {branch_pct}% |\n"
           )
           jv = os.environ.get('MATRIX_JAVA', '?')
-          summary = f"## Coverage (Java {jv})\n| Metric | Coverage |\n|---|---|\n{rows}"
+          summary = (
+              f"## Coverage (Java {jv})\n"
+              f"_Source: `{report}`"
+              + (f" (1 of {len(reports)} reports — alphabetically first)" if len(reports) > 1 else "")
+              + "_\n"
+              f"| Metric | Coverage |\n|---|---|\n{rows}"
+          )
           with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as f:
               f.write(summary)
           EOF

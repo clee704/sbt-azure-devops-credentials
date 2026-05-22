@@ -16,7 +16,9 @@ libraryDependencies += "org.scalatest" %% "scalatest" % "3.2.18" % Test
 // Exclude integration tests (tagged as Slow) by default
 Test / testOptions += Tests.Argument(TestFrameworks.ScalaTest, "-l", "org.scalatest.tagobjects.Slow")
 
-// Coverage thresholds — keep them tight so regressions in test discipline fail CI.
-coverageMinimumStmtTotal := 95
-coverageMinimumBranchTotal := 95
+// Coverage gate matches current coverage exactly. Any regression in test
+// discipline must be addressed with a new test, or — if a statement is
+// genuinely unreachable from unit tests — with a `$COVERAGE-OFF$` marker.
+coverageMinimumStmtTotal := 100
+coverageMinimumBranchTotal := 100
 coverageFailOnMinimum := true

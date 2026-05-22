@@ -360,6 +360,33 @@ class CredentialsBuilderSpec extends AnyFlatSpec with Matchers {
     }
   }
 
+  it should "restore the Azure-identity log level when concurrent CredentialsBuilder instances acquire tokens" in {
+    // Regression guard for the save/set/restore race: without a JVM-wide lock,
+    // two builders could observe each other's "off" mutation and leave the
+    // property pinned to "off" after both threads finish.
+    val prop = "org.slf4j.simpleLogger.log.com.azure.identity"
+    val original = Option(System.getProperty(prop))
+    System.setProperty(prop, "initial")
+    try {
+      val threads = (1 to 8).map { i =>
+        val t = new Thread(new Runnable {
+          def run(): Unit = {
+            new TokenProbe(credentialReturning(s"tok-$i")).fetch()
+          }
+        })
+        t.start()
+        t
+      }
+      threads.foreach(_.join())
+      System.getProperty(prop) shouldBe "initial"
+    } finally {
+      original match {
+        case Some(v) => System.setProperty(prop, v)
+        case None => System.clearProperty(prop)
+      }
+    }
+  }
+
   // ─── updateCoursierConf ─────────────────────────────────────────────────
 
   "updateCoursierConf" should "add authentication for MavenRepos with matching credentials" in {

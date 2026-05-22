@@ -262,28 +262,35 @@ object AzureDevOpsCredentialsPlugin extends AutoPlugin {
       // Suppress Azure Identity logging during token acquisition. ChainedTokenCredential
       // logs [ERROR] for each provider that fails, which are expected failures — not all
       // providers are available in all environments.
-      val previousLevel = Option(System.getProperty(AzureIdentityLogProperty))
-      System.setProperty(AzureIdentityLogProperty, "off")
-      try {
-        val credential = newCredential()
-        val request = new TokenRequestContext().addScopes(AzureDevOpsScope)
-        val token = credential.getToken(request).block()
-        if (token != null) {
-          log.debug("access token created")
-          Some(token.getToken())
-        } else {
-          log.warn(s"failed to get access token (getToken() returned null)")
-          None
-        }
-      } catch {
-        case NonFatal(e) =>
-          log.warn(s"failed to get access token. Did you forget to run `az login`?")
-          log.debug(e.toString())
-          None
-      } finally {
-        previousLevel match {
-          case Some(level) => System.setProperty(AzureIdentityLogProperty, level)
-          case None => System.clearProperty(AzureIdentityLogProperty)
+      //
+      // Lock is at object (singleton) scope, not `this`, because the system property is
+      // JVM-wide global state. Without this, two CredentialsBuilder instances on different
+      // threads (e.g. multi-project sbt builds resolving credentials in parallel) could
+      // interleave save/set/restore and leave the property pinned to "off" indefinitely.
+      AzureDevOpsCredentialsPlugin.synchronized {
+        val previousLevel = Option(System.getProperty(AzureIdentityLogProperty))
+        System.setProperty(AzureIdentityLogProperty, "off")
+        try {
+          val credential = newCredential()
+          val request = new TokenRequestContext().addScopes(AzureDevOpsScope)
+          val token = credential.getToken(request).block()
+          if (token != null) {
+            log.debug("access token created")
+            Some(token.getToken())
+          } else {
+            log.warn(s"failed to get access token (getToken() returned null)")
+            None
+          }
+        } catch {
+          case NonFatal(e) =>
+            log.warn(s"failed to get access token. Did you forget to run `az login`?")
+            log.debug(e.toString())
+            None
+        } finally {
+          previousLevel match {
+            case Some(level) => System.setProperty(AzureIdentityLogProperty, level)
+            case None => System.clearProperty(AzureIdentityLogProperty)
+          }
         }
       }
     }
