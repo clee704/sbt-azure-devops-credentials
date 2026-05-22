@@ -21,4 +21,36 @@ jobs:
           java-version: ${{ matrix.java }}
           cache: sbt
       - uses: sbt/setup-sbt@v1
-      - run: sbt -batch test
+      - run: sbt -batch clean coverage test coverageReport
+      - name: Coverage summary
+        if: always()
+        env:
+          MATRIX_JAVA: ${{ matrix.java }}
+        run: |
+          python3 - <<'EOF'
+          import xml.etree.ElementTree as ET, glob, os
+          reports = glob.glob('target/scala-*/sbt-*/scoverage-report/scoverage.xml')
+          if not reports:
+              exit(0)
+          root = ET.parse(reports[0]).getroot()
+          a = root.attrib
+          stmt_total = int(a.get('statement-count', 0))
+          stmt_done  = int(a.get('statements-invoked', 0))
+          stmt_pct   = a.get('statement-rate', '0')
+          branch_pct = a.get('branch-rate', '0')
+          rows = (
+              f"| Statement | {stmt_pct}% ({stmt_done}/{stmt_total}) |\n"
+              f"| Branch    | {branch_pct}% |\n"
+          )
+          jv = os.environ.get('MATRIX_JAVA', '?')
+          summary = f"## Coverage (Java {jv})\n| Metric | Coverage |\n|---|---|\n{rows}"
+          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as f:
+              f.write(summary)
+          EOF
+      - name: Upload coverage report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: scoverage-report-java-${{ matrix.java }}
+          path: target/scala-*/sbt-*/scoverage-report/
+          if-no-files-found: ignore
