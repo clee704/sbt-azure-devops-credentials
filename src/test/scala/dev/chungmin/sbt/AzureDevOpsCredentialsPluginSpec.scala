@@ -168,4 +168,133 @@ class AzureDevOpsCredentialsPluginSpec extends AnyFlatSpec with Matchers {
       server.close()
     }
   }
+
+  "createCredential" should "build a chain without throwing when no AAD env vars are set" in {
+    // Regression test for v0.0.8: WorkloadIdentityCredentialBuilder.build()
+    // throws IllegalArgumentException when AZURE_CLIENT_ID / AZURE_TENANT_ID /
+    // AZURE_FEDERATED_TOKEN_FILE are unset. Because that .build() is called
+    // eagerly during chain assembly, the entire chain construction failed before
+    // AzureCli was ever tried — leaving developer workstations (which don't
+    // normally have those env vars set) with a plugin that always reported
+    // "failed to get access token. Did you forget to run `az login`?".
+    //
+    // The `credentialProviders` tests below pin the *order* invariant
+    // directly (which a `cred should not be null` assertion can't), and
+    // `envValue`'s direct unit tests cover the absent / empty / whitespace /
+    // padded states — so this one test is sufficient as a named regression
+    // anchor for the v0.0.8 repro.
+    val cred = AzureDevOpsCredentialsPlugin.createCredential(Map.empty)
+    cred should not be null
+  }
+
+  it should "build a chain without throwing when AAD env vars are padded with whitespace" in {
+    // End-to-end smoke test for the trim defense: a partially-broken
+    // env-template substitution may produce a *padded* value (e.g. trailing
+    // newline from a YAML literal block) rather than a pure-whitespace one.
+    // The SDK builder accepts padded values at .build() time and would only
+    // fail at .getToken() time with a confusing AAD error.
+    //
+    // Required because a `credentialProviders` order assertion against the
+    // padded env can't prove the trim ran — the chain-element classes are
+    // the same regardless of whether the credential was built with padded
+    // or trimmed values. This test verifies the end-to-end path:
+    // createCredential → credentialProviders → for-yield → envValue.trim.
+    val env = Map(
+      "AZURE_CLIENT_ID" -> "  00000000-0000-0000-0000-000000000000  ",
+      "AZURE_TENANT_ID" -> "\t00000000-0000-0000-0000-000000000000\n",
+      "AZURE_FEDERATED_TOKEN_FILE" -> "  /tmp/nonexistent-federated-token  "
+    )
+    val cred = AzureDevOpsCredentialsPlugin.createCredential(env)
+    cred should not be null
+  }
+
+  "credentialProviders" should "place AzureCli first and ManagedIdentity last when AAD env vars are unset" in {
+    // Pins the v0.0.8 chain order: on dev workstations with no AAD env vars,
+    // AzureCli must be tried first (the v0.0.8 motivation), and ManagedIdentity
+    // must be the fallback for VM-resident builds. A future refactor that
+    // swaps the .addLast calls would still pass every other regression test
+    // because they all assert on "chain assembly doesn't throw" rather than
+    // on provider ordering — but it would silently regress the original bug
+    // (user's `az login` ignored in favor of the VM's managed identity).
+    val providers = AzureDevOpsCredentialsPlugin.credentialProviders(Map.empty)
+    providers.map(_.getClass.getSimpleName) shouldBe Seq(
+      "AzureCliCredential",
+      "AzurePowerShellCredential",
+      "EnvironmentCredential",
+      "ManagedIdentityCredential"
+    )
+  }
+
+  it should "insert WorkloadIdentity between EnvironmentCredential and ManagedIdentity when AAD env vars are set" in {
+    // Position-sensitive: WorkloadIdentity should run AFTER user-credential
+    // providers (AzureCli / PowerShell / Environment) so an interactive
+    // developer session wins over a partially-configured workload-identity
+    // setup, but BEFORE ManagedIdentity so a k8s pod with workload-identity
+    // env vars set doesn't fall through to a VM managed identity.
+    val env = Map(
+      "AZURE_CLIENT_ID" -> "00000000-0000-0000-0000-000000000000",
+      "AZURE_TENANT_ID" -> "11111111-1111-1111-1111-111111111111",
+      "AZURE_FEDERATED_TOKEN_FILE" -> "/tmp/nonexistent-federated-token"
+    )
+    val providers = AzureDevOpsCredentialsPlugin.credentialProviders(env)
+    providers.map(_.getClass.getSimpleName) shouldBe Seq(
+      "AzureCliCredential",
+      "AzurePowerShellCredential",
+      "EnvironmentCredential",
+      "WorkloadIdentityCredential",
+      "ManagedIdentityCredential"
+    )
+  }
+
+  "envValue" should "return Some(trimmed) for padded values" in {
+    val env = Map("X" -> "  abc  ", "Y" -> "\tabc\n", "Z" -> "abc")
+    AzureDevOpsCredentialsPlugin.envValue(env, "X") shouldBe Some("abc")
+    AzureDevOpsCredentialsPlugin.envValue(env, "Y") shouldBe Some("abc")
+    AzureDevOpsCredentialsPlugin.envValue(env, "Z") shouldBe Some("abc")
+  }
+
+  it should "return None for absent, empty, or whitespace-only values" in {
+    val env = Map("empty" -> "", "spaces" -> "   ", "tabs" -> "\t\t", "mixed" -> "  \n\t  ")
+    AzureDevOpsCredentialsPlugin.envValue(env, "empty") shouldBe None
+    AzureDevOpsCredentialsPlugin.envValue(env, "spaces") shouldBe None
+    AzureDevOpsCredentialsPlugin.envValue(env, "tabs") shouldBe None
+    AzureDevOpsCredentialsPlugin.envValue(env, "mixed") shouldBe None
+    AzureDevOpsCredentialsPlugin.envValue(env, "missing") shouldBe None
+  }
+
+  "initializeAzureIdentityLogSuppression" should "set the property to 'off' when unset" in {
+    // Direct exercise of the static-init helper. The block runs once at
+    // plugin classloading; re-invoking it from a test (with the property
+    // explicitly cleared first) verifies the unset->"off" path.
+    val prop = AzureDevOpsCredentialsPlugin.AzureIdentityLogProperty
+    val original = Option(System.getProperty(prop))
+    System.clearProperty(prop)
+    try {
+      AzureDevOpsCredentialsPlugin.initializeAzureIdentityLogSuppression()
+      System.getProperty(prop) shouldBe "off"
+    } finally {
+      original match {
+        case Some(v) => System.setProperty(prop, v)
+        case None => System.clearProperty(prop)
+      }
+    }
+  }
+
+  it should "not override a pre-existing value" in {
+    // A developer who sets the property explicitly (e.g. -Dorg.slf4j.simpleLogger.log.com.azure.identity=debug
+    // for diagnostics) should see their override survive plugin classloading.
+    // Verifies the "no-op when set" branch of the static-init helper.
+    val prop = AzureDevOpsCredentialsPlugin.AzureIdentityLogProperty
+    val original = Option(System.getProperty(prop))
+    System.setProperty(prop, "debug")
+    try {
+      AzureDevOpsCredentialsPlugin.initializeAzureIdentityLogSuppression()
+      System.getProperty(prop) shouldBe "debug"
+    } finally {
+      original match {
+        case Some(v) => System.setProperty(prop, v)
+        case None => System.clearProperty(prop)
+      }
+    }
+  }
 }

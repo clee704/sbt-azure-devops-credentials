@@ -1,0 +1,75 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        java: [8, 11, 17, 21]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: ${{ matrix.java }}
+          cache: sbt
+      # `cache: sbt` above covers ~/.sbt and ~/.ivy2/cache but not the Coursier cache,
+      # which is where sbt 1.3+ resolves most artifacts (azure-identity + transitive
+      # netty/reactor, scalatest, scoverage runtime, etc.). Cache it explicitly so the
+      # JDK matrix doesn't re-download on every job.
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cache/coursier
+          key: coursier-${{ runner.os }}-${{ hashFiles('build.sbt', 'project/plugins.sbt', 'project/build.properties') }}
+          restore-keys: |
+            coursier-${{ runner.os }}-
+      - uses: sbt/setup-sbt@v1
+      - run: sbt -batch clean coverage test coverageReport
+      - name: Coverage summary
+        if: always()
+        env:
+          MATRIX_JAVA: ${{ matrix.java }}
+        run: |
+          python3 - <<'EOF'
+          import xml.etree.ElementTree as ET, glob, os
+          # Sort for deterministic selection when multiple reports exist (e.g. future
+          # cross-sbt-version builds). Today this glob matches exactly one file.
+          reports = sorted(glob.glob('target/scala-*/sbt-*/scoverage-report/scoverage.xml'))
+          if not reports:
+              exit(0)
+          report = reports[0]
+          root = ET.parse(report).getroot()
+          a = root.attrib
+          stmt_total = int(a.get('statement-count', 0))
+          stmt_done  = int(a.get('statements-invoked', 0))
+          stmt_pct   = a.get('statement-rate', '0')
+          branch_pct = a.get('branch-rate', '0')
+          rows = (
+              f"| Statement | {stmt_pct}% ({stmt_done}/{stmt_total}) |\n"
+              f"| Branch    | {branch_pct}% |\n"
+          )
+          jv = os.environ.get('MATRIX_JAVA', '?')
+          summary = (
+              f"## Coverage (Java {jv})\n"
+              f"_Source: `{report}`"
+              + (f" (1 of {len(reports)} reports — alphabetically first)" if len(reports) > 1 else "")
+              + "_\n"
+              f"| Metric | Coverage |\n|---|---|\n{rows}"
+          )
+          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as f:
+              f.write(summary)
+          EOF
+      - name: Upload coverage report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: scoverage-report-java-${{ matrix.java }}
+          path: target/scala-*/sbt-*/scoverage-report/
+          if-no-files-found: ignore
