@@ -632,9 +632,14 @@ class CredentialsBuilderSpec extends AnyFlatSpec with Matchers with BeforeAndAft
     AzureDevOpsCredentialsPlugin.defaultPort(new URI("https://example.com/")) shouldBe 443
   }
 
-  it should "default to 80 for non-https schemes with no explicit port" in {
-    // The branch is "https -> 443 else 80"; assert the else path on a non-https,
-    // non-http scheme (e.g. ftp) actually returns 80, not 443.
+  it should "fall through to 80 for non-http(s) schemes (gate-coverage tail, not a canonical default)" in {
+    // Pins the `else 80` branch in defaultPort. No real call site passes a
+    // non-http(s) URI here — headRequestHeaders is fed MavenRepo URIs that
+    // isAzureDevOpsHost has already filtered to http/https — but the
+    // 100% coverage gate requires the else branch be exercised. Using
+    // ftp:// (canonical port 21) intentionally: the assertion `shouldBe 80`
+    // (NOT `shouldBe 21`) documents that this is a fallback, not a
+    // scheme-aware lookup.
     AzureDevOpsCredentialsPlugin.defaultPort(new URI("ftp://example.com/")) shouldBe 80
   }
 }

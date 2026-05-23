@@ -254,11 +254,23 @@ object AzureDevOpsCredentialsPlugin extends AutoPlugin {
     host != null && (host.endsWith("pkgs.visualstudio.com") || host == "pkgs.dev.azure.com")
   }
 
-  /** Return the explicit port from `uri`, or the scheme default (443 for `https`,
-    * 80 for everything else). Extracted as a pure helper for direct unit testing —
-    * exercising it through [[headRequestHeaders]] would require an actual socket
-    * round-trip and only verifies behavior tautologically (any port choice fails
-    * the same way against an unresponsive address). */
+  /** Return the effective HTTP/HTTPS port for `uri`: the explicit port when
+    * set, otherwise 443 for `https` and 80 for everything else.
+    *
+    * Despite the general-sounding name, this is intentionally an http/https
+    * helper, not a scheme-aware lookup. It exists only because
+    * [[headRequestHeaders]] needs a port to open a socket against MavenRepo
+    * resolvers, which the rest of the plugin filters to http/https-only URIs
+    * via [[isAzureDevOpsHost]] (no `ftp:`/`file:`/`ssh:` resolver reaches
+    * here in practice). The `else 80` branch is the gate-coverage tail that
+    * keeps the helper total — not a canonical default for `ftp` or any
+    * other non-http(s) scheme, where 80 is wrong (ftp's canonical port is
+    * 21, ssh's is 22, etc.).
+    *
+    * Extracted as a pure helper for direct unit testing — exercising it
+    * through [[headRequestHeaders]] would require an actual socket
+    * round-trip and only verifies behavior tautologically (any port choice
+    * fails the same way against an unresponsive address). */
   private[chungmin] def defaultPort(uri: URI): Int =
     if (uri.getPort >= 0) uri.getPort
     else if (uri.getScheme == "https") 443
