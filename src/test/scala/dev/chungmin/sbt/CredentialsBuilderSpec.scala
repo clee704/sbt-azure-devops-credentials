@@ -368,7 +368,7 @@ class CredentialsBuilderSpec extends AnyFlatSpec with Matchers with BeforeAndAft
   }
 
   it should "restore the previous Azure-identity log level after token acquisition" in {
-    val prop = "org.slf4j.simpleLogger.log.com.azure.identity"
+    val prop = AzureDevOpsCredentialsPlugin.AzureIdentityLogProperty
     val original = Option(System.getProperty(prop))
     try {
       System.setProperty(prop, "debug")
@@ -383,7 +383,7 @@ class CredentialsBuilderSpec extends AnyFlatSpec with Matchers with BeforeAndAft
   }
 
   it should "clear the Azure-identity log level when none was set before" in {
-    val prop = "org.slf4j.simpleLogger.log.com.azure.identity"
+    val prop = AzureDevOpsCredentialsPlugin.AzureIdentityLogProperty
     val original = Option(System.getProperty(prop))
     System.clearProperty(prop)
     try {
@@ -416,7 +416,7 @@ class CredentialsBuilderSpec extends AnyFlatSpec with Matchers with BeforeAndAft
     // 8-thread variant verifies the live integration path through
     // getTokenImpl; the nested-suppression test verifies the counted-set
     // helpers directly.
-    val prop = "org.slf4j.simpleLogger.log.com.azure.identity"
+    val prop = AzureDevOpsCredentialsPlugin.AzureIdentityLogProperty
     val original = Option(System.getProperty(prop))
     System.setProperty(prop, "initial")
     try {
@@ -449,7 +449,7 @@ class CredentialsBuilderSpec extends AnyFlatSpec with Matchers with BeforeAndAft
     // Directly exercises the counted-set helpers to assert the invariant the
     // 8-thread concurrency test relies on: inner acquire/release does NOT
     // restore the property while an outer suppression is still in flight.
-    val prop = "org.slf4j.simpleLogger.log.com.azure.identity"
+    val prop = AzureDevOpsCredentialsPlugin.AzureIdentityLogProperty
     val original = Option(System.getProperty(prop))
     System.setProperty(prop, "initial")
     try {

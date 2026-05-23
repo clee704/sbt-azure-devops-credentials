@@ -59,8 +59,15 @@ object AzureDevOpsCredentialsPlugin extends AutoPlugin {
 
   /** System property to control Azure Identity SDK logging.
     * Set to "off" during token acquisition to suppress expected [ERROR] messages
-    * from ChainedTokenCredential trying each provider in sequence. */
-  private val AzureIdentityLogProperty = "org.slf4j.simpleLogger.log.com.azure.identity"
+    * from ChainedTokenCredential trying each provider in sequence.
+    *
+    * Exposed as `private[chungmin]` (not pure `private`) so test sites can
+    * reference the property name through the constant instead of re-declaring
+    * the string literal in every test that touches the property. Keeping the
+    * literal in one place means an Azure-SDK-driven rename (or an SLF4J
+    * binding-key change) wouldn't silently leave tests asserting against a
+    * stale property name. */
+  private[chungmin] val AzureIdentityLogProperty = "org.slf4j.simpleLogger.log.com.azure.identity"
 
   /** Set [[AzureIdentityLogProperty]] to `"off"` at plugin classloading if it
     * isn't already set. Defends against the SLF4J SimpleLogger caching

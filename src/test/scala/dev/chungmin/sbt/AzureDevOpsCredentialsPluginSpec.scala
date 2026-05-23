@@ -177,73 +177,28 @@ class AzureDevOpsCredentialsPluginSpec extends AnyFlatSpec with Matchers {
     // AzureCli was ever tried — leaving developer workstations (which don't
     // normally have those env vars set) with a plugin that always reported
     // "failed to get access token. Did you forget to run `az login`?".
+    //
+    // The `credentialProviders` tests below pin the *order* invariant
+    // directly (which a `cred should not be null` assertion can't), and
+    // `envValue`'s direct unit tests cover the absent / empty / whitespace /
+    // padded states — so this one test is sufficient as a named regression
+    // anchor for the v0.0.8 repro.
     val cred = AzureDevOpsCredentialsPlugin.createCredential(Map.empty)
     cred should not be null
   }
 
-  it should "build a chain without throwing when workload-identity env vars are set" in {
-    val env = Map(
-      "AZURE_CLIENT_ID" -> "00000000-0000-0000-0000-000000000000",
-      "AZURE_TENANT_ID" -> "00000000-0000-0000-0000-000000000000",
-      "AZURE_FEDERATED_TOKEN_FILE" -> "/tmp/nonexistent-federated-token"
-    )
-    val cred = AzureDevOpsCredentialsPlugin.createCredential(env)
-    cred should not be null
-  }
-
-  it should "build a chain without throwing when AAD env vars are present but empty" in {
-    // The Azure SDK's WorkloadIdentityCredentialBuilder.build() rejects both
-    // null AND empty strings — `env.get("AZURE_CLIENT_ID")` returning Some("")
-    // would re-trigger the same eager IllegalArgumentException that broke
-    // v0.0.8, just by a different code path. Some CI images, partially-
-    // configured shells, and k8s service-account projection edge cases can
-    // export env vars as empty strings, so this case needs the same
-    // skip-the-credential treatment as "var entirely absent".
-    val env = Map(
-      "AZURE_CLIENT_ID" -> "",
-      "AZURE_TENANT_ID" -> "",
-      "AZURE_FEDERATED_TOKEN_FILE" -> ""
-    )
-    val cred = AzureDevOpsCredentialsPlugin.createCredential(env)
-    cred should not be null
-  }
-
-  it should "build a chain without throwing when only some AAD env vars are empty" in {
-    // Mixed case: AZURE_CLIENT_ID is empty but the other two are set. Without
-    // the per-value .filter(_.trim.nonEmpty), the for-comprehension would still
-    // succeed (Some("") satisfies the comprehension) and the builder's
-    // .clientId("") + .build() would throw.
-    val env = Map(
-      "AZURE_CLIENT_ID" -> "",
-      "AZURE_TENANT_ID" -> "00000000-0000-0000-0000-000000000000",
-      "AZURE_FEDERATED_TOKEN_FILE" -> "/tmp/nonexistent-federated-token"
-    )
-    val cred = AzureDevOpsCredentialsPlugin.createCredential(env)
-    cred should not be null
-  }
-
-  it should "build a chain without throwing when AAD env vars are whitespace-only" in {
-    // The Azure SDK's `Strings.isNullOrEmpty` only checks null + empty; whitespace-
-    // only values like "  " or "\t" pass validation and end up in the credential
-    // as garbage. `.trim.nonEmpty` (instead of just `.nonEmpty`) skips them, which
-    // is defense-in-depth against a partially-broken env-template substitution.
-    val env = Map(
-      "AZURE_CLIENT_ID" -> "  ",
-      "AZURE_TENANT_ID" -> "\t",
-      "AZURE_FEDERATED_TOKEN_FILE" -> "   \n"
-    )
-    val cred = AzureDevOpsCredentialsPlugin.createCredential(env)
-    cred should not be null
-  }
-
   it should "build a chain without throwing when AAD env vars are padded with whitespace" in {
-    // Continuation of the whitespace defense above: a partially-broken
+    // End-to-end smoke test for the trim defense: a partially-broken
     // env-template substitution may produce a *padded* value (e.g. trailing
     // newline from a YAML literal block) rather than a pure-whitespace one.
-    // The SDK builder accepts padded values at .build() time, so this test
-    // doesn't tautologically verify the trim — that's what `envValue`'s
-    // direct unit tests are for. This is a smoke test that the chain
-    // assembly path tolerates padded values.
+    // The SDK builder accepts padded values at .build() time and would only
+    // fail at .getToken() time with a confusing AAD error.
+    //
+    // Required because a `credentialProviders` order assertion against the
+    // padded env can't prove the trim ran — the chain-element classes are
+    // the same regardless of whether the credential was built with padded
+    // or trimmed values. This test verifies the end-to-end path:
+    // createCredential → credentialProviders → for-yield → envValue.trim.
     val env = Map(
       "AZURE_CLIENT_ID" -> "  00000000-0000-0000-0000-000000000000  ",
       "AZURE_TENANT_ID" -> "\t00000000-0000-0000-0000-000000000000\n",
@@ -311,7 +266,7 @@ class AzureDevOpsCredentialsPluginSpec extends AnyFlatSpec with Matchers {
     // Direct exercise of the static-init helper. The block runs once at
     // plugin classloading; re-invoking it from a test (with the property
     // explicitly cleared first) verifies the unset->"off" path.
-    val prop = "org.slf4j.simpleLogger.log.com.azure.identity"
+    val prop = AzureDevOpsCredentialsPlugin.AzureIdentityLogProperty
     val original = Option(System.getProperty(prop))
     System.clearProperty(prop)
     try {
@@ -329,7 +284,7 @@ class AzureDevOpsCredentialsPluginSpec extends AnyFlatSpec with Matchers {
     // A developer who sets the property explicitly (e.g. -Dorg.slf4j.simpleLogger.log.com.azure.identity=debug
     // for diagnostics) should see their override survive plugin classloading.
     // Verifies the "no-op when set" branch of the static-init helper.
-    val prop = "org.slf4j.simpleLogger.log.com.azure.identity"
+    val prop = AzureDevOpsCredentialsPlugin.AzureIdentityLogProperty
     val original = Option(System.getProperty(prop))
     System.setProperty(prop, "debug")
     try {
