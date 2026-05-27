@@ -80,12 +80,20 @@ class CredentialsBuilderSpec extends AnyFlatSpec with Matchers with BeforeAndAft
   private def testBuilder(
       realm: URI => Option[String] = _ => Some(AdoRealm),
       token: () => Option[String] = () => Some("test-pat"),
-      settings: File = new File("/this/path/does/not/exist")
+      settings: File = new File("/this/path/does/not/exist"),
+      stale: (URI, String, String, String) => Boolean = (_, _, _, _) => false
   ): AzureDevOpsCredentialsPlugin.CredentialsBuilder = {
     new AzureDevOpsCredentialsPlugin.CredentialsBuilder(nullLog) {
       override protected def getRealm(uri: URI): Option[String] = realm(uri)
       override protected def getToken(): Option[String] = token()
       override protected def mavenSettingsFile: File = settings
+      // Default the probe verdict to "not stale" so existing tests preserve
+      // their pre-probe semantics ("settings.xml entries are always trusted")
+      // without depending on JVM-global system properties or actual network
+      // I/O. Probe-specific tests pass an explicit stale function.
+      override private[chungmin] def isStaleSettingsEntry(
+          uri: URI, host: String, user: String, password: String): Boolean =
+        stale(uri, host, user, password)
     }
   }
 
@@ -617,6 +625,67 @@ class CredentialsBuilderSpec extends AnyFlatSpec with Matchers with BeforeAndAft
     }
   }
 
+  // ─── configureSslEndpointIdentification (TLS hostname verification) ────
+
+  "configureSslEndpointIdentification" should
+      "set the SSL endpoint identification algorithm to HTTPS" in {
+    // The JDK default for raw SSLSocket leaves endpointIdentificationAlgorithm
+    // unset (null) → cert-chain validation happens but the server's CN/SAN is
+    // NEVER checked against the URI host. With v0.0.10's authenticated probes
+    // putting PATs and Bearer tokens on the wire, that gap becomes a credential-
+    // leak vector against misissued CAs (DigiNotar-class) + DNS hijack. This
+    // helper opts in to "HTTPS" — the canonical JDK algorithm name — so the
+    // TLS handshake fails when the cert hostname doesn't match. Asserting the
+    // PARAMETER is set (rather than spinning up a self-signed test server) is
+    // sufficient: the JDK enforces the algorithm once we ask for it, and the
+    // production code calls this helper on every TLS socket headRequest opens.
+    val factory = javax.net.ssl.SSLSocketFactory.getDefault
+      .asInstanceOf[javax.net.ssl.SSLSocketFactory]
+    // createSocket() with no args returns an unconnected SSLSocket — sufficient
+    // for parameter inspection without any network or cert plumbing.
+    val socket = factory.createSocket().asInstanceOf[javax.net.ssl.SSLSocket]
+    try {
+      // Pre-condition: the JDK default really is null/unset.
+      // (Sanity-check assertion: if a future JDK changes this default to "HTTPS"
+      // out of the box, this test fires and the maintainer can decide whether
+      // the helper is still load-bearing or has become a tautology.)
+      val defaultAlgo = socket.getSSLParameters.getEndpointIdentificationAlgorithm
+      assert(defaultAlgo == null || defaultAlgo.isEmpty,
+        s"Expected JDK default endpointIdentificationAlgorithm to be null/empty, got '$defaultAlgo'")
+      val configured = AzureDevOpsCredentialsPlugin.configureSslEndpointIdentification(socket)
+      configured.getSSLParameters.getEndpointIdentificationAlgorithm shouldBe "HTTPS"
+      // The helper returns the same socket (no new instance).
+      (configured eq socket) shouldBe true
+    } finally socket.close()
+  }
+
+  it should "fail the TLS handshake when the cert hostname doesn't match the URI host (end-to-end)" in {
+    // Real-network smoke test: connect to a public ADO endpoint via an
+    // explicitly-wrong hostname. The JDK's HTTPS algorithm should detect the
+    // mismatch during the handshake and throw SSLHandshakeException BEFORE
+    // any HTTP bytes (including the Authorization header) reach the wire.
+    //
+    // We pick `wrong.host.badssl.com` — a public test endpoint maintained
+    // by badssl.com that serves a valid cert for `*.badssl.com` (NOT for
+    // `wrong.host.badssl.com`), which is the canonical "hostname mismatch"
+    // scenario for SSL test infrastructure. If this becomes flaky (badssl
+    // could go down), demote to @Slow and rely on the
+    // configureSslEndpointIdentification unit test above to lock in behavior.
+    val uri = new URI("https://wrong.host.badssl.com/")
+    try {
+      AzureDevOpsCredentialsPlugin.headRequestHeaders(uri)
+      fail("Expected SSLHandshakeException on hostname mismatch, got success")
+    } catch {
+      case _: javax.net.ssl.SSLHandshakeException => succeed
+      case e: SSLException if Option(e.getMessage).exists(_.toLowerCase.contains("host")) =>
+        succeed // some JDK variants surface as plain SSLException with a hostname-mismatch message
+      case e: java.io.IOException =>
+        // Network unreachable / DNS resolution failure — don't fail the test
+        // on infrastructure issues. The unit test above still covers behavior.
+        cancel(s"Skipping end-to-end SSL hostname check (network/DNS unreachable): $e")
+    }
+  }
+
   // ─── defaultPort (pure helper — no socket) ──────────────────────────────
 
   "defaultPort" should "return the explicit port when set" in {
@@ -641,5 +710,700 @@ class CredentialsBuilderSpec extends AnyFlatSpec with Matchers with BeforeAndAft
     // (NOT `shouldBe 21`) documents that this is a fallback, not a
     // scheme-aware lookup.
     AzureDevOpsCredentialsPlugin.defaultPort(new URI("ftp://example.com/")) shouldBe 80
+  }
+
+  // ─── basicAuthHeader (pure helper) ─────────────────────────────────────
+
+  "basicAuthHeader" should "produce Basic <base64(user:pass)>" in {
+    // Aladdin:OpenSesame example from RFC 7617 §2.
+    AzureDevOpsCredentialsPlugin.basicAuthHeader(
+      "Aladdin", "OpenSesame") shouldBe "Basic QWxhZGRpbjpPcGVuU2VzYW1l"
+  }
+
+  it should "handle empty username and password without throwing" in {
+    AzureDevOpsCredentialsPlugin.basicAuthHeader("", "") shouldBe "Basic Og=="
+  }
+
+  // ─── validateExistingCredentialsMode (pure helper) ─────────────────────
+
+  /** Saves the validation-mode property, runs `body`, restores. Pattern
+    * matches the existing AzureIdentityLogProperty save/restore in this file. */
+  private def withValidationMode[A](value: Option[String])(body: => A): A = {
+    val prop = AzureDevOpsCredentialsPlugin.ValidateExistingCredentialsProperty
+    val original = Option(System.getProperty(prop))
+    value match {
+      case Some(v) => System.setProperty(prop, v)
+      case None => System.clearProperty(prop)
+    }
+    try body finally {
+      original match {
+        case Some(v) => System.setProperty(prop, v)
+        case None => System.clearProperty(prop)
+      }
+    }
+  }
+
+  "validateExistingCredentialsMode" should "default to 'auto' when property is unset" in {
+    withValidationMode(None) {
+      AzureDevOpsCredentialsPlugin.validateExistingCredentialsMode() shouldBe
+        AzureDevOpsCredentialsPlugin.ValidateAuto
+    }
+  }
+
+  it should "return 'always' when property is 'always'" in {
+    withValidationMode(Some("always")) {
+      AzureDevOpsCredentialsPlugin.validateExistingCredentialsMode() shouldBe
+        AzureDevOpsCredentialsPlugin.ValidateAlways
+    }
+  }
+
+  it should "return 'never' when property is 'never'" in {
+    withValidationMode(Some("never")) {
+      AzureDevOpsCredentialsPlugin.validateExistingCredentialsMode() shouldBe
+        AzureDevOpsCredentialsPlugin.ValidateNever
+    }
+  }
+
+  it should "fall back to 'auto' for unknown values" in {
+    withValidationMode(Some("garbage")) {
+      AzureDevOpsCredentialsPlugin.validateExistingCredentialsMode() shouldBe
+        AzureDevOpsCredentialsPlugin.ValidateAuto
+    }
+  }
+
+  it should "be case-insensitive" in {
+    withValidationMode(Some("ALWAYS")) {
+      AzureDevOpsCredentialsPlugin.validateExistingCredentialsMode() shouldBe
+        AzureDevOpsCredentialsPlugin.ValidateAlways
+    }
+    withValidationMode(Some("Never")) {
+      AzureDevOpsCredentialsPlugin.validateExistingCredentialsMode() shouldBe
+        AzureDevOpsCredentialsPlugin.ValidateNever
+    }
+  }
+
+  // ─── headRequest (status code parsing — new in 0.0.10) ─────────────────
+
+  "headRequest" should "parse the status code from the response line" in {
+    val response =
+      "HTTP/1.1 401 Unauthorized\r\n" +
+      "WWW-Authenticate: Basic realm=\"r\"\r\n\r\n"
+    withRawHeadServer(response) { (host, port) =>
+      val uri = new URI(s"http://$host:$port/")
+      val (status, headers) = AzureDevOpsCredentialsPlugin.headRequest(uri, None)
+      status shouldBe Some(401)
+      headers should contain ("WWW-Authenticate" -> "Basic realm=\"r\"")
+    }
+  }
+
+  it should "return Some(200) on a successful response" in {
+    withRawHeadServer("HTTP/1.1 200 OK\r\n\r\n") { (host, port) =>
+      val uri = new URI(s"http://$host:$port/")
+      val (status, _) = AzureDevOpsCredentialsPlugin.headRequest(uri, None)
+      status shouldBe Some(200)
+    }
+  }
+
+  it should "throw IllegalArgumentException when authHeader is set but scheme is not https (defense-in-depth)" in {
+    // The cleartext-credential guard: future callers that try to send an
+    // Authorization header over a non-https URI must hard-fail, not silently
+    // leak credentials over plain TCP. The production probe path
+    // short-circuits this case earlier via isStaleSettingsEntry's
+    // scheme-check, but the guard here is the second gate — so a future
+    // refactor that introduces a new caller (or removes the entry-point
+    // guard) cannot regress to writing Authorization in cleartext without
+    // tripping this require().
+    val uri = new URI("http://example.com/")
+    val ex = intercept[IllegalArgumentException] {
+      AzureDevOpsCredentialsPlugin.headRequest(uri, Some("Basic abcdef"))
+    }
+    ex.getMessage should include ("https")
+  }
+
+  it should "allow Authorization header when scheme is https (require does not fire)" in {
+    // Verifies the require's positive branch: https URI + auth is allowed
+    // through (whether the actual TLS handshake succeeds is irrelevant —
+    // we only care that the require itself does not trip). The connect
+    // is expected to fail (host:port unreachable for the bogus URI), which
+    // is a non-IllegalArgumentException — exactly the contract we want.
+    val uri = new URI("https://localhost:1/")
+    intercept[Exception] {
+      AzureDevOpsCredentialsPlugin.headRequest(uri, Some("Basic abcdef"))
+    } shouldBe a [java.io.IOException]
+  }
+
+  "buildHeadRequestLine" should "produce a HEAD line with Host and the Authorization header when provided" in {
+    val req = AzureDevOpsCredentialsPlugin.buildHeadRequestLine(
+      host = "pkgs.dev.azure.com",
+      path = "/myorg/_packaging/myfeed/maven/v1",
+      authHeader = Some("Basic QWxhZGRpbjpPcGVuU2VzYW1l"))
+    req shouldBe
+      "HEAD /myorg/_packaging/myfeed/maven/v1 HTTP/1.1\r\n" +
+      "Host: pkgs.dev.azure.com\r\n" +
+      "Authorization: Basic QWxhZGRpbjpPcGVuU2VzYW1l\r\n" +
+      "Connection: close\r\n\r\n"
+  }
+
+  it should "produce a HEAD line WITHOUT the Authorization header when None" in {
+    val req = AzureDevOpsCredentialsPlugin.buildHeadRequestLine(
+      host = "pkgs.dev.azure.com",
+      path = "/",
+      authHeader = None)
+    req shouldBe
+      "HEAD / HTTP/1.1\r\n" +
+      "Host: pkgs.dev.azure.com\r\n" +
+      "Connection: close\r\n\r\n"
+  }
+
+  it should "produce a HEAD line with the Bearer token when provided" in {
+    val req = AzureDevOpsCredentialsPlugin.buildHeadRequestLine(
+      host = "pkgs.dev.azure.com",
+      path = "/myorg/_packaging/myfeed/maven/v1",
+      authHeader = Some("Bearer eyJhbGciOiJSUzI1NiJ9.fake.token"))
+    req should include ("Authorization: Bearer eyJhbGciOiJSUzI1NiJ9.fake.token\r\n")
+    req should startWith ("HEAD /myorg/_packaging/myfeed/maven/v1 HTTP/1.1\r\n")
+    req should endWith ("Connection: close\r\n\r\n")
+  }
+
+  it should "return None as status when the status line is malformed" in {
+    withRawHeadServer("MALFORMED\r\n\r\n") { (host, port) =>
+      val uri = new URI(s"http://$host:$port/")
+      val (status, _) = AzureDevOpsCredentialsPlugin.headRequest(uri, None)
+      status shouldBe None
+    }
+  }
+
+  it should "return None as status when the status line has no parseable number" in {
+    withRawHeadServer("HTTP/1.1 NOT-A-NUMBER\r\n\r\n") { (host, port) =>
+      val uri = new URI(s"http://$host:$port/")
+      val (status, _) = AzureDevOpsCredentialsPlugin.headRequest(uri, None)
+      status shouldBe None
+    }
+  }
+
+  // ─── probeWithBasic / probeWithBearer NonFatal swallow ─────────────────
+  //
+  // The decision-tree tests below override these seams wholesale, so the real
+  // try/catch wrappers around headRequest never fire in those paths. Cover
+  // them directly with an unreachable https URI so the connect throws a
+  // NonFatal IOException → catch returns None → caller treats as "trust the
+  // entry". Mirrors the headRequest-https-unbound-port test above.
+
+  "probeWithBasic" should "swallow NonFatal exceptions from headRequest and return None" in {
+    val builder = new AzureDevOpsCredentialsPlugin.CredentialsBuilder(nullLog)
+    val uri = new URI("https://localhost:1/")
+    builder.probeWithBasic(uri, "localhost", "u", "p") shouldBe None
+  }
+
+  "probeWithBearer" should "swallow NonFatal exceptions from headRequest and return None" in {
+    val builder = new AzureDevOpsCredentialsPlugin.CredentialsBuilder(nullLog)
+    val uri = new URI("https://localhost:1/")
+    builder.probeWithBearer(uri, "localhost", "entra-token") shouldBe None
+  }
+
+  // ─── isStaleSettingsEntry (the probe decision matrix) ──────────────────
+
+  /** A CredentialsBuilder that lets each test pin individual seams.
+    *
+    * - `probeStatus` controls what `headRequest` "returns" — we override
+    *   `isStaleSettingsEntry` wholesale and let `probeStatus` drive the
+    *   simulated probe outcome, so no real network call happens.
+    * - `tokenAvailable` controls whether `getToken()` returns Some/None,
+    *   exercising the auto-mode fork. */
+  private class ProbeBuilder(
+      probeStatus: Option[Int],
+      tokenAvailable: Boolean = true
+  ) extends AzureDevOpsCredentialsPlugin.CredentialsBuilder(nullLog) {
+    override protected def getToken(): Option[String] =
+      if (tokenAvailable) Some("entra-token") else None
+    // Stub the network call: override isStaleSettingsEntry wholesale so the
+    // simulated probeStatus drives the decision, no actual headRequest fires.
+    override private[chungmin] def isStaleSettingsEntry(
+        uri: URI, host: String, user: String, password: String): Boolean = {
+      // Re-implement the decision tree inline rather than calling super, so
+      // `probeStatus` drives the simulated probe outcome without any real
+      // headRequest / network round-trip. Mirrors enough of the production
+      // short-circuit logic (Never/host gates) for the tests below to
+      // exercise both the gate-level short-circuits (never mode, non-ADO
+      // host, null host) and the inner decision tree (Basic-probe 200/401,
+      // auto+token availability, network error) via the return value alone.
+      val mode = AzureDevOpsCredentialsPlugin.validateExistingCredentialsMode()
+      if (mode == AzureDevOpsCredentialsPlugin.ValidateNever) return false
+      if (host == null || !AzureDevOpsCredentialsPlugin.isAzureDevOpsHost(host)) return false
+      probeStatus match {
+        case Some(401) =>
+          if (mode == AzureDevOpsCredentialsPlugin.ValidateAlways) true
+          else getToken().isDefined
+        case _ => false
+      }
+    }
+  }
+
+  "isStaleSettingsEntry" should "trust unconditionally in 'never' mode" in {
+    withValidationMode(Some("never")) {
+      val b = new ProbeBuilder(Some(401))
+      b.isStaleSettingsEntry(
+        new URI("https://pkgs.dev.azure.com/o/p/_packaging/f/maven/v1"),
+        "pkgs.dev.azure.com", "u", "p") shouldBe false
+    }
+  }
+
+  it should "trust unconditionally for non-ADO hosts" in {
+    withValidationMode(Some("always")) {
+      val b = new ProbeBuilder(Some(401))
+      b.isStaleSettingsEntry(
+        new URI("https://repo1.maven.org/maven2/"),
+        "repo1.maven.org", "u", "p") shouldBe false
+    }
+  }
+
+  it should "trust unconditionally when host is null" in {
+    withValidationMode(Some("always")) {
+      val b = new ProbeBuilder(Some(401))
+      b.isStaleSettingsEntry(
+        new URI("file:///somewhere"), null, "u", "p") shouldBe false
+    }
+  }
+
+  it should "drop on 401 in 'always' mode" in {
+    withValidationMode(Some("always")) {
+      val b = new ProbeBuilder(Some(401))
+      b.isStaleSettingsEntry(
+        new URI("https://pkgs.dev.azure.com/o/p/_packaging/f/maven/v1"),
+        "pkgs.dev.azure.com", "u", "p") shouldBe true
+    }
+  }
+
+  it should "drop on 401 in 'auto' mode when Entra is reachable" in {
+    withValidationMode(Some("auto")) {
+      val b = new ProbeBuilder(Some(401), tokenAvailable = true)
+      b.isStaleSettingsEntry(
+        new URI("https://pkgs.dev.azure.com/o/p/_packaging/f/maven/v1"),
+        "pkgs.dev.azure.com", "u", "p") shouldBe true
+    }
+  }
+
+  it should "keep on 401 in 'auto' mode when Entra is unreachable" in {
+    withValidationMode(Some("auto")) {
+      val b = new ProbeBuilder(Some(401), tokenAvailable = false)
+      b.isStaleSettingsEntry(
+        new URI("https://pkgs.dev.azure.com/o/p/_packaging/f/maven/v1"),
+        "pkgs.dev.azure.com", "u", "p") shouldBe false
+    }
+  }
+
+  it should "trust on non-401 (200, 404, etc.)" in {
+    withValidationMode(Some("always")) {
+      val b200 = new ProbeBuilder(Some(200))
+      b200.isStaleSettingsEntry(
+        new URI("https://pkgs.dev.azure.com/o/p/_packaging/f/maven/v1"),
+        "pkgs.dev.azure.com", "u", "p") shouldBe false
+      val b404 = new ProbeBuilder(Some(404))
+      b404.isStaleSettingsEntry(
+        new URI("https://pkgs.dev.azure.com/o/p/_packaging/f/maven/v1"),
+        "pkgs.dev.azure.com", "u", "p") shouldBe false
+    }
+  }
+
+  it should "trust on network error (status = None)" in {
+    withValidationMode(Some("always")) {
+      val b = new ProbeBuilder(None)
+      b.isStaleSettingsEntry(
+        new URI("https://pkgs.dev.azure.com/o/p/_packaging/f/maven/v1"),
+        "pkgs.dev.azure.com", "u", "p") shouldBe false
+    }
+  }
+
+  // ─── buildCredentialsFromMavenSettings probe wiring ────────────────────
+
+  // These tests exercise the wiring that consults isStaleSettingsEntry from
+  // inside buildCredentialsFromMavenSettings — verifying that a stale verdict
+  // drops the entry and a fresh verdict keeps it. The `stale` callback here
+  // (passed into testBuilder) stubs isStaleSettingsEntry wholesale; the real
+  // probeAndDecideImpl decision tree has its own dedicated tests below.
+  "buildCredentialsFromMavenSettings probe" should
+      "drop the settings entry when stale function returns true" in {
+    // Use a resolver pointed at a real-but-ADO-shaped host so the wiring
+    // accepts it; the override below skips the network. The key is exercising
+    // buildCredentialsFromMavenSettings' new probe branch (which calls
+    // isStaleSettingsEntry unconditionally — mode handling lives inside that
+    // method, so this test does not need to pin a specific validation mode).
+    val settings = writeSettings(
+      """<?xml version="1.0"?>
+        |<settings><servers><server>
+        |  <id>AzureDevOps</id><username>u</username><password>bad-pat</password>
+        |</server></servers></settings>""".stripMargin)
+    val resolver = MavenRepository("AzureDevOps", AdoFeedUrl)
+    val builder = testBuilder(
+      settings = settings,
+      stale = (_, _, _, _) => true)
+    val result = builder.buildCredentials(Seq.empty, Seq(resolver))
+    // The settings entry was dropped, and buildCredentialsWithAccessToken
+    // generated an Entra cred for the host (with userName from URL parsing).
+    val users = result.collect { case c: DirectCredentials => c.userName }
+    users shouldBe Seq("myorg")
+  }
+
+  it should "keep the settings entry when stale function returns false" in {
+    val settings = writeSettings(
+      """<?xml version="1.0"?>
+        |<settings><servers><server>
+        |  <id>AzureDevOps</id><username>preserved</username><password>p</password>
+        |</server></servers></settings>""".stripMargin)
+    val resolver = MavenRepository("AzureDevOps", AdoFeedUrl)
+    val builder = testBuilder(settings = settings)  // stale defaults to false
+    val result = builder.buildCredentials(Seq.empty, Seq(resolver))
+    val users = result.collect { case c: DirectCredentials => c.userName }
+    users shouldBe Seq("preserved")
+  }
+
+  // ─── probe cache (per-builder, URI-keyed) ──────────────────────────────
+
+  "isStaleSettingsEntry cache" should "actually cache in the real implementation (one probeAndDecideImpl call per URI)" in {
+    withValidationMode(Some("always")) {
+      var calls = 0
+      val builder = new AzureDevOpsCredentialsPlugin.CredentialsBuilder(nullLog) {
+        override protected[chungmin] def probeAndDecideImpl(
+            uri: URI, host: String, user: String, password: String, mode: String): Boolean = {
+          calls += 1
+          true
+        }
+      }
+      val uri = new URI("https://pkgs.dev.azure.com/o/p/_packaging/f/maven/v1")
+      builder.isStaleSettingsEntry(uri, "pkgs.dev.azure.com", "u", "p") shouldBe true
+      builder.isStaleSettingsEntry(uri, "pkgs.dev.azure.com", "u", "p") shouldBe true
+      builder.isStaleSettingsEntry(uri, "pkgs.dev.azure.com", "u", "p") shouldBe true
+      calls shouldBe 1
+    }
+  }
+
+  // ─── Real isStaleSettingsEntry mode + host filtering ───────────────────
+
+  // ProbeBuilder above stubs out the entire isStaleSettingsEntry method, so
+  // it doesn't exercise the production decision tree's mode/host gates. These
+  // tests use the production CredentialsBuilder (only stubbing probeAndDecideImpl)
+  // so the mode == never / host == null / host non-ADO branches are covered.
+
+  "real isStaleSettingsEntry" should "short-circuit to false in 'never' mode without probing" in {
+    withValidationMode(Some("never")) {
+      var calls = 0
+      val builder = new AzureDevOpsCredentialsPlugin.CredentialsBuilder(nullLog) {
+        override protected[chungmin] def probeAndDecideImpl(
+            uri: URI, host: String, user: String, password: String, mode: String): Boolean = {
+          calls += 1
+          true
+        }
+      }
+      builder.isStaleSettingsEntry(
+        new URI("https://pkgs.dev.azure.com/o/p/_packaging/f/maven/v1"),
+        "pkgs.dev.azure.com", "u", "p") shouldBe false
+      calls shouldBe 0
+    }
+  }
+
+  it should "short-circuit to false when host is null without probing" in {
+    withValidationMode(Some("always")) {
+      var calls = 0
+      val builder = new AzureDevOpsCredentialsPlugin.CredentialsBuilder(nullLog) {
+        override protected[chungmin] def probeAndDecideImpl(
+            uri: URI, host: String, user: String, password: String, mode: String): Boolean = {
+          calls += 1
+          true
+        }
+      }
+      builder.isStaleSettingsEntry(
+        new URI("file:///somewhere"), null, "u", "p") shouldBe false
+      calls shouldBe 0
+    }
+  }
+
+  it should "short-circuit to false for non-ADO hosts without probing" in {
+    withValidationMode(Some("always")) {
+      var calls = 0
+      val builder = new AzureDevOpsCredentialsPlugin.CredentialsBuilder(nullLog) {
+        override protected[chungmin] def probeAndDecideImpl(
+            uri: URI, host: String, user: String, password: String, mode: String): Boolean = {
+          calls += 1
+          true
+        }
+      }
+      builder.isStaleSettingsEntry(
+        new URI("https://repo1.maven.org/maven2/"),
+        "repo1.maven.org", "u", "p") shouldBe false
+      calls shouldBe 0
+    }
+  }
+
+  it should "short-circuit to false for http:// URIs without probing (no cleartext credentials)" in {
+    // Even when the host passes isAzureDevOpsHost (user typed the right
+    // ADO hostname), an http:// scheme would cause headRequest to use a plain
+    // TCP socket and put the Authorization header on the wire in cleartext.
+    // Same vulnerability class as a missing TLS endpoint-ID check
+    // (credentials leaking via insecure transport) but a distinct codepath:
+    // TLS endpoint-ID verification only protects you GIVEN TLS, not the case
+    // of no TLS at all. Trust-the-entry (return false) is the right default
+    // for the misconfigured-resolver case: preserves legacy v0.0.9 behavior
+    // and guarantees no credentials reach a cleartext wire from the probe path.
+    withValidationMode(Some("always")) {
+      var calls = 0
+      val builder = new AzureDevOpsCredentialsPlugin.CredentialsBuilder(nullLog) {
+        override protected[chungmin] def probeAndDecideImpl(
+            uri: URI, host: String, user: String, password: String, mode: String): Boolean = {
+          calls += 1
+          true
+        }
+      }
+      builder.isStaleSettingsEntry(
+        new URI("http://pkgs.dev.azure.com/o/p/_packaging/f/maven/v1"),
+        "pkgs.dev.azure.com", "u", "p") shouldBe false
+      calls shouldBe 0
+    }
+  }
+
+  // ─── probeAndDecideImpl decision-tree tests ────────────────────────────
+
+  // These exercise probeAndDecideImpl's branching logic directly, using
+  // stubbed probeWithBasic / probeWithBearer values. The headRequest
+  // wire-format and TLS-endpoint-ID invariants are verified by their
+  // dedicated tests above.
+
+  "probeAndDecideImpl" should "return false (trust) when network probe returns 200" in {
+    val builder = stubProbeBuilder(
+      basicStatus = Some(200), bearerStatus = None, tokenValue = "n/a")
+    val uri = new URI("https://pkgs.dev.azure.com/o/p/_packaging/f/maven/v1")
+    builder.probeAndDecideImpl(
+      uri, "pkgs.dev.azure.com", "u", "p",
+      AzureDevOpsCredentialsPlugin.ValidateAlways) shouldBe false
+  }
+
+  it should "return true (drop) when network probe returns 401 in 'always' mode" in {
+    val builder = stubProbeBuilder(
+      basicStatus = Some(401), bearerStatus = None, tokenValue = "n/a")
+    val uri = new URI("https://pkgs.dev.azure.com/o/p/_packaging/f/maven/v1")
+    builder.probeAndDecideImpl(
+      uri, "pkgs.dev.azure.com", "u", "p",
+      AzureDevOpsCredentialsPlugin.ValidateAlways) shouldBe true
+  }
+
+  it should "return false (keep) when probe is 401 + auto + Entra unreachable" in {
+    val builder = new AzureDevOpsCredentialsPlugin.CredentialsBuilder(nullLog) {
+      override protected def newCredential(): TokenCredential =
+        fakeCredential(Mono.error[AccessToken](new RuntimeException("no az")))
+      override protected[chungmin] def probeWithBasic(
+          uri: URI, host: String, user: String, password: String): Option[Int] = Some(401)
+      // probeWithBearer is unreachable here (getToken returns None first); leave default
+    }
+    val uri = new URI("https://pkgs.dev.azure.com/o/p/_packaging/f/maven/v1")
+    builder.probeAndDecideImpl(
+      uri, "pkgs.dev.azure.com", "u", "p",
+      AzureDevOpsCredentialsPlugin.ValidateAuto) shouldBe false
+  }
+
+  it should "return false (trust) when probe throws a network error" in {
+    val builder = stubProbeBuilder(
+      basicStatus = None, bearerStatus = None, tokenValue = "n/a")
+    val uri = new URI("https://pkgs.dev.azure.com/o/p/_packaging/f/maven/v1")
+    builder.probeAndDecideImpl(
+      uri, "pkgs.dev.azure.com", "u", "p",
+      AzureDevOpsCredentialsPlugin.ValidateAlways) shouldBe false
+  }
+
+  // ─── auto-mode Bearer verification: re-probe with the new Entra token ─────
+
+  /** Test helper: build a CredentialsBuilder whose probeWithBasic /
+    * probeWithBearer return canned `Option[Int]` values, and whose
+    * newCredential returns a fixed token string. Lets the
+    * `probeAndDecideImpl` decision-tree tests — both the simple-decision
+    * cases (Basic-probe only: 200, 401-always, network error) and the
+    * auto-mode Bearer-verify cases (Basic 401 → re-probe with Entra
+    * token: Bearer 200 / Bearer 401 / Bearer network error) — assert the
+    * decision logic directly against specific (Basic-probe, Bearer-probe)
+    * outcome combinations, without driving any actual network round-trip.
+    * `headRequest` now refuses to send Authorization headers over http://
+    * URIs, so the previous `withSequentialServers + http://localhost:$port/`
+    * pattern can no longer hit the probe path; stubbing the probe helpers
+    * (the boundary just above `headRequest`) keeps these tests focused on
+    * the decision logic. The `headRequest` wire-format and TLS-endpoint-ID
+    * invariants have their own dedicated tests above. Not used by the
+    * `CredentialsBuilder(log, mode)` constructor tests — those exercise
+    * the mode-injection path, not the probe decision tree. */
+  private def stubProbeBuilder(
+      basicStatus: Option[Int],
+      bearerStatus: Option[Int],
+      tokenValue: String
+  ): AzureDevOpsCredentialsPlugin.CredentialsBuilder =
+    new AzureDevOpsCredentialsPlugin.CredentialsBuilder(nullLog) {
+      override protected def newCredential(): TokenCredential = credentialReturning(tokenValue)
+      override protected[chungmin] def probeWithBasic(
+          uri: URI, host: String, user: String, password: String): Option[Int] = basicStatus
+      override protected[chungmin] def probeWithBearer(
+          uri: URI, host: String, token: String): Option[Int] = bearerStatus
+    }
+
+  "probeAndDecideImpl (auto, Entra works, Bearer probe succeeds)" should
+      "return true (drop entry) when the verification probe doesn't get 401" in {
+    val builder = stubProbeBuilder(
+      basicStatus = Some(401),
+      bearerStatus = Some(200),
+      tokenValue = "ok-token")
+    val uri = new URI("https://pkgs.dev.azure.com/o/p/_packaging/f/maven/v1")
+    builder.probeAndDecideImpl(
+      uri, "pkgs.dev.azure.com", "u", "p",
+      AzureDevOpsCredentialsPlugin.ValidateAuto) shouldBe true
+  }
+
+  "probeAndDecideImpl (auto, Entra works, Bearer probe ALSO 401)" should
+      "return false (keep entry) — the Entra identity has no feed access" in {
+    // The Entra-identity-lacks-feed-access scenario: stale PAT → 401 on Basic probe; getToken() succeeds
+    // via (say) Managed Identity on an Azure VM; but the MI has no access to
+    // the user's feed, so Bearer-probe with the new token ALSO returns 401.
+    // Overriding the user's PAT with that token would leave the build still
+    // failing, with a misleading "fell through to Entra" log line. The fix:
+    // verify the new token's access first, fall back to keeping the stale
+    // entry with a clearer diagnostic.
+    val builder = stubProbeBuilder(
+      basicStatus = Some(401),
+      bearerStatus = Some(401),
+      tokenValue = "no-access-token")
+    val uri = new URI("https://pkgs.dev.azure.com/o/p/_packaging/f/maven/v1")
+    builder.probeAndDecideImpl(
+      uri, "pkgs.dev.azure.com", "u", "p",
+      AzureDevOpsCredentialsPlugin.ValidateAuto) shouldBe false
+  }
+
+  "probeAndDecideImpl (auto, Bearer verify network error)" should
+      "assume token works (return true, drop entry) — be optimistic on transient blip" in {
+    // Basic probe answered with 401 (stale); Bearer-verify fails with a
+    // network error (probeWithBearer catches the IOException and returns
+    // None). probeAndDecideImpl treats None as "not 401" → take the
+    // optimistic success branch. Deliberate UX choice: a transient blip
+    // on the verify probe shouldn't re-strand the user with their already-
+    // stale PAT.
+    val builder = stubProbeBuilder(
+      basicStatus = Some(401),
+      bearerStatus = None,
+      tokenValue = "token")
+    val uri = new URI("https://pkgs.dev.azure.com/o/p/_packaging/f/maven/v1")
+    builder.probeAndDecideImpl(
+      uri, "pkgs.dev.azure.com", "u", "p",
+      AzureDevOpsCredentialsPlugin.ValidateAuto) shouldBe true
+  }
+
+  // ─── CredentialsBuilder(log, mode) constructor: per-project mode injection ──
+
+  "CredentialsBuilder(log, mode)" should
+      "use the passed-in mode regardless of -D system property (per-project scoping)" in {
+    // Pin system property to "never"; build with mode="always". The probe
+    // must fire (per the always mode) regardless of the property.
+    withValidationMode(Some("never")) {
+      val settings = writeSettings(
+        """<?xml version="1.0"?>
+          |<settings><servers><server>
+          |  <id>R</id><username>u</username><password>p</password>
+          |</server></servers></settings>""".stripMargin)
+      val resolver = MavenRepository("R", AdoFeedUrl)
+      val builder = new AzureDevOpsCredentialsPlugin.CredentialsBuilder(nullLog, "always") {
+        override protected def mavenSettingsFile: File = settings
+        override protected def getRealm(uri: URI): Option[String] = Some(AdoRealm)
+        override protected def getToken(): Option[String] = Some("t")
+        override protected[chungmin] def probeAndDecideImpl(
+            uri: URI, host: String, user: String, password: String, m: String): Boolean = {
+          m shouldBe AzureDevOpsCredentialsPlugin.ValidateAlways
+          true
+        }
+      }
+      val result = builder.buildCredentials(Seq.empty, Seq(resolver))
+      val users = result.collect { case c: DirectCredentials => c.userName }
+      users shouldBe Seq("myorg")  // Entra-generated, not "u" from settings
+    }
+  }
+
+  it should "fall back to the legacy single-arg overload reading the system property" in {
+    withValidationMode(Some("never")) {
+      val builder = new AzureDevOpsCredentialsPlugin.CredentialsBuilder(nullLog) {
+        override protected[chungmin] def probeAndDecideImpl(
+            uri: URI, host: String, user: String, password: String, m: String): Boolean = {
+          fail(s"probeAndDecideImpl should NOT be called in 'never' mode; got $m")
+        }
+      }
+      builder.isStaleSettingsEntry(
+        new URI("https://pkgs.dev.azure.com/o/p/_packaging/f/maven/v1"),
+        "pkgs.dev.azure.com", "u", "p") shouldBe false
+    }
+  }
+
+  it should "normalize mode case-insensitively when passed in directly (regression guard)" in {
+    // Without case-insensitive normalization, `CredentialsBuilder(log, "NEVER")` would compare
+    // raw "NEVER" against the lowercase ValidateNever constant, fail equality,
+    // and silently fall into the auto branch — defeating users who set
+    // `-Ddev.chungmin.azure.validateExistingCredentials=NEVER` (a common shell
+    // habit) or `azureDevOpsValidateExistingCredentials := "Never"` in build.sbt.
+    withValidationMode(None) {
+      // Use "NEVER" upper-case via the 2-arg ctor; assert it short-circuits
+      // (never-mode skips probing entirely, so probeAndDecideImpl would not
+      // fire — which the override below FAILs the test if it does).
+      val builder = new AzureDevOpsCredentialsPlugin.CredentialsBuilder(nullLog, "NEVER") {
+        override protected[chungmin] def probeAndDecideImpl(
+            uri: URI, host: String, user: String, password: String, m: String): Boolean = {
+          fail(s"raw 'NEVER' must be normalized to ValidateNever and short-circuit; got $m")
+        }
+      }
+      builder.isStaleSettingsEntry(
+        new URI("https://pkgs.dev.azure.com/o/p/_packaging/f/maven/v1"),
+        "pkgs.dev.azure.com", "u", "p") shouldBe false
+    }
+  }
+
+  it should "normalize unknown mode values to auto" in {
+    // Same regression family: a typo like `"alway"` should fall through to
+    // auto, not crash and not pin some other unintended branch.
+    val builder = new AzureDevOpsCredentialsPlugin.CredentialsBuilder(nullLog, "alway") {
+      override protected[chungmin] def probeAndDecideImpl(
+          uri: URI, host: String, user: String, password: String, m: String): Boolean = {
+        m shouldBe AzureDevOpsCredentialsPlugin.ValidateAuto
+        false
+      }
+    }
+    builder.isStaleSettingsEntry(
+      new URI("https://pkgs.dev.azure.com/o/p/_packaging/f/maven/v1"),
+      "pkgs.dev.azure.com", "u", "p") shouldBe false
+  }
+
+  // ─── probe cache key: per-feed-URI (host-keyed would collide across feeds) ──
+
+  "isStaleSettingsEntry cache" should
+      "probe distinct feeds on the same host INDEPENDENTLY (not host-keyed)" in {
+    // Bug class: keying the cache by host alone would let two ADO feeds on the same
+    // host (e.g. `<org>.pkgs.visualstudio.com/A365/_packaging/FeedA/...` vs
+    // `<org>.pkgs.visualstudio.com/A365/_packaging/FeedB/...`, or two orgs on
+    // `pkgs.dev.azure.com`) would inherit each other's verdicts — silently
+    // trusting a stale entry for FeedB if FeedA's PAT was valid (defeats the
+    // PR), or silently dropping a valid entry for FeedA if FeedB's PAT was
+    // stale (defeats user intent). Fix keyed cache by URI string.
+    var probesByUri = Map.empty[String, Int]
+    val builder = new AzureDevOpsCredentialsPlugin.CredentialsBuilder(nullLog, "always") {
+      override protected[chungmin] def probeAndDecideImpl(
+          uri: URI, host: String, user: String, password: String, m: String): Boolean = {
+        probesByUri = probesByUri.updated(
+          uri.toString, probesByUri.getOrElse(uri.toString, 0) + 1)
+        // Return different verdicts for different URIs to make the bug
+        // observable: if cache were host-keyed, the second call would see
+        // the cached verdict from the first.
+        if (uri.toString.endsWith("/FeedA/maven/v1")) true else false
+      }
+    }
+    val feedA = new URI("https://pkgs.dev.azure.com/myorg/myproject/_packaging/FeedA/maven/v1")
+    val feedB = new URI("https://pkgs.dev.azure.com/myorg/myproject/_packaging/FeedB/maven/v1")
+    val host = "pkgs.dev.azure.com"
+    builder.isStaleSettingsEntry(feedA, host, "u", "p") shouldBe true
+    builder.isStaleSettingsEntry(feedB, host, "u", "p") shouldBe false
+    // Both URIs must have been probed (one each), not collapsed to one probe
+    // on the shared host.
+    probesByUri.values.toSeq.sorted shouldBe Seq(1, 1)
+    probesByUri.size shouldBe 2
+    // Re-probe each URI: cache MUST hit on second call (still 1 probe per URI).
+    builder.isStaleSettingsEntry(feedA, host, "u", "p") shouldBe true
+    builder.isStaleSettingsEntry(feedB, host, "u", "p") shouldBe false
+    probesByUri.values.toSeq.sorted shouldBe Seq(1, 1)
   }
 }

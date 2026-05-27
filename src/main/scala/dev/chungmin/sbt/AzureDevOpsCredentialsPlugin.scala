@@ -18,7 +18,7 @@ package dev.chungmin.sbt
 import java.io.{BufferedReader, BufferedWriter, InputStreamReader, OutputStreamWriter}
 import java.net.{InetSocketAddress, Socket}
 
-import javax.net.ssl.SSLSocketFactory
+import javax.net.ssl.{SSLSocket, SSLSocketFactory}
 
 import scala.util.control.NonFatal
 import scala.xml.XML
@@ -43,6 +43,23 @@ import com.azure.identity.{
 object AzureDevOpsCredentialsPlugin extends AutoPlugin {
   override def trigger = allRequirements
 
+  object autoImport {
+    /** Controls how `~/.m2/settings.xml` `<server>` entries are validated
+      * against the feed before being trusted.
+      *
+      * Values: `"auto"` (default), `"always"`, `"never"`. See
+      * [[AzureDevOpsCredentialsPlugin.ValidateExistingCredentialsProperty]]
+      * for full semantics. Defaults to the value of
+      * `-Ddev.chungmin.azure.validateExistingCredentials=...` at task
+      * evaluation time, and overrides that property for the project it's
+      * scoped to — per-project, not JVM-global. In a multi-project build,
+      * two projects can have different validation modes via this setting
+      * (impossible via the `-D` property alone). */
+    val azureDevOpsValidateExistingCredentials =
+      settingKey[String]("Validate ~/.m2/settings.xml entries against feeds: auto|always|never")
+  }
+  import autoImport._
+
   // NOTE on the package-private modifier used throughout this file:
   // `private[chungmin]` (not `private[sbt]`) is deliberate. The plugin's
   // package is `dev.chungmin.sbt`, so Scala's enclosing-package resolution
@@ -56,6 +73,41 @@ object AzureDevOpsCredentialsPlugin extends AutoPlugin {
 
   /** Azure DevOps resource scope for access tokens. */
   private[chungmin] val AzureDevOpsScope = "499b84ac-1321-427f-aa17-267ca6975798/.default"
+
+  /** System property controlling whether existing `~/.m2/settings.xml`
+    * `<server>` entries are probed against the feed before being trusted.
+    *
+    * Values (case-insensitive):
+    *
+    *   - `"auto"` (default): probe each entry; on a 401, try Entra and
+    *     verify the new token actually has feed access before dropping the
+    *     entry. Falls back to keeping the entry with diagnostic INFO logs
+    *     when Entra is unreachable or the verified token lacks feed scope.
+    *   - `"always"`: probe; on 401, drop unconditionally (no Entra-side
+    *     verification — Entra's eventual failure becomes the user-visible
+    *     error if it can't acquire a working token either).
+    *   - `"never"`: legacy behavior — trust settings.xml entries
+    *     unconditionally, without probing.
+    *
+    * See [[CredentialsBuilder.isStaleSettingsEntry]] for the full
+    * branch-by-branch decision tree (the central authority on per-branch
+    * behavior; the natural place for future Bearer-verify changes to land).
+    *
+    * Configurable as `-D` JVM property, in `.jvmopts`, or via `SBT_OPTS`.
+    * The `build.sbt` setting [[autoImport.azureDevOpsValidateExistingCredentials]]
+    * defaults to this property's value and is passed directly into
+    * [[CredentialsBuilder]] at task evaluation time — taking precedence over
+    * this property for the project it's scoped to. The setting deliberately
+    * does NOT write back to the system property (which is JVM-global) so
+    * per-project overrides don't leak across projects in a multi-module
+    * build. */
+  private[chungmin] val ValidateExistingCredentialsProperty =
+    "dev.chungmin.azure.validateExistingCredentials"
+
+  /** Legal values for [[ValidateExistingCredentialsProperty]]. */
+  private[chungmin] val ValidateAuto = "auto"
+  private[chungmin] val ValidateAlways = "always"
+  private[chungmin] val ValidateNever = "never"
 
   /** System property to control Azure Identity SDK logging.
     * Set to "off" during token acquisition to suppress expected [ERROR] messages
@@ -276,12 +328,55 @@ object AzureDevOpsCredentialsPlugin extends AutoPlugin {
     else if (uri.getScheme == "https") 443
     else 80
 
-  /** Send an unauthenticated HEAD request and return the response headers.
+  /** Build the HTTP/1.1 HEAD request line + headers as a single string,
+    * ready to write to the socket. Pure helper (no I/O) so the request
+    * shape is directly unit-testable — verifying via [[headRequest]]
+    * end-to-end would require an actual round-trip, and the auth-on-wire
+    * positive case can't run over plain TCP after the
+    * `https`-required guard on [[headRequest]].
     *
-    * Uses a raw socket instead of HttpURLConnection to avoid triggering
-    * sbt's global IvyAuthenticator, which logs spurious "Unable to find
-    * credentials" error messages when the server responds with 401. */
-  private[chungmin] def headRequestHeaders(uri: URI): Seq[(String, String)] = {
+    * Format: `HEAD <path> HTTP/1.1\r\nHost: <host>\r\n[Authorization: <auth>\r\n]Connection: close\r\n\r\n`.
+    * The Authorization line is included iff `authHeader` is `Some(...)`. */
+  private[chungmin] def buildHeadRequestLine(
+      host: String, path: String, authHeader: Option[String]): String = {
+    val authLine = authHeader.map(h => s"Authorization: $h\r\n").getOrElse("")
+    s"HEAD $path HTTP/1.1\r\nHost: $host\r\n${authLine}Connection: close\r\n\r\n"
+  }
+
+  /** Send a HEAD request with optional credentials and return both the
+    * response status code (parsed from the first line) and the response
+    * headers.
+    *
+    * Uses a raw socket instead of HttpURLConnection for two reasons:
+    *
+    *  - To avoid triggering sbt's global IvyAuthenticator (which logs
+    *    spurious "Unable to find credentials" errors on 401) — this
+    *    motivated the original v0.0.9 helper that only sent
+    *    unauthenticated realm-detection probes.
+    *  - To keep the Authorization header from being logged by Aether/sbt's
+    *    HTTP transport layer — a non-trivial PAT-leakage hazard introduced
+    *    in v0.0.10 when this helper started carrying PAT/Bearer credentials
+    *    for the authenticated-probe path.
+    *
+    * The authorization header (if provided) is set exactly once and never
+    * re-sent on a redirect (we don't follow them — the response line is
+    * read and returned verbatim).
+    *
+    * **Defense-in-depth on cleartext credentials.** When `authHeader` is
+    * `Some(...)` and `uri.getScheme` is not `"https"`, throws
+    * `IllegalArgumentException` before opening the socket — preventing
+    * any future caller (refactor, new probe helper, etc.) from accidentally
+    * writing the Authorization header over a plain-TCP wire. The
+    * `isStaleSettingsEntry` entry-point guard at the call site short-
+    * circuits the same case for the production probe path; this guard is
+    * the second gate, so the comment claim "defense-in-depth" is literally
+    * two gates instead of one. */
+  private[chungmin] def headRequest(
+      uri: URI, authHeader: Option[String]): (Option[Int], Seq[(String, String)]) = {
+    require(
+      authHeader.isEmpty || uri.getScheme == "https",
+      s"headRequest with an Authorization header requires an https URI; got ${uri.getScheme}://${uri.getHost} " +
+        "(refusing to write credentials over a plain-TCP wire)")
     val host = uri.getHost
     val port = defaultPort(uri)
     val path = Option(uri.getRawPath).filter(_.nonEmpty).getOrElse("/")
@@ -290,21 +385,37 @@ object AzureDevOpsCredentialsPlugin extends AutoPlugin {
       rawSocket.connect(new InetSocketAddress(host, port), 10000)
       rawSocket.setSoTimeout(10000)
       val socket = if (uri.getScheme == "https") {
-        SSLSocketFactory.getDefault.asInstanceOf[SSLSocketFactory]
+        val sslSocket = SSLSocketFactory.getDefault.asInstanceOf[SSLSocketFactory]
           .createSocket(rawSocket, host, port, /* autoClose = */ true)
+          .asInstanceOf[SSLSocket]
+        // Enable HTTPS endpoint identification: verifies the server cert's
+        // CN/SAN matches the URI's host. Raw SSLSocket does cert-chain
+        // validation by default but skips hostname matching unless we opt in
+        // here (documented JDK behavior through 21+). Critical for the v0.0.10
+        // authenticated-probe path: we now put PATs (Basic) and Entra tokens
+        // (Bearer) on the wire via this helper, so a misissued cert from a
+        // publicly-trusted CA + DNS hijack would otherwise read credentials
+        // off the wire. Pre-v0.0.10 the helper only sent unauthenticated
+        // realm-detection probes, so the gap was harmless then.
+        configureSslEndpointIdentification(sslSocket)
       } else {
         rawSocket
       }
       try {
         val writer = new BufferedWriter(
           new OutputStreamWriter(socket.getOutputStream, "UTF-8"))
-        writer.write(
-          s"HEAD $path HTTP/1.1\r\nHost: $host\r\nConnection: close\r\n\r\n")
+        writer.write(buildHeadRequestLine(host, path, authHeader))
         writer.flush()
         val reader = new BufferedReader(
           new InputStreamReader(socket.getInputStream, "UTF-8"))
         val headers = Seq.newBuilder[(String, String)]
-        reader.readLine() // skip status line
+        // Parse the status line: "HTTP/1.1 401 Unauthorized" -> Some(401).
+        // Tolerant parse: any malformed status line returns None.
+        val statusLine = reader.readLine()
+        val status: Option[Int] = Option(statusLine).flatMap { line =>
+          val parts = line.split(" ", 3)
+          if (parts.length >= 2) scala.util.Try(parts(1).toInt).toOption else None
+        }
         var line = reader.readLine()
         while (line != null && line.nonEmpty) {
           val colon = line.indexOf(':')
@@ -313,7 +424,7 @@ object AzureDevOpsCredentialsPlugin extends AutoPlugin {
           }
           line = reader.readLine()
         }
-        headers.result()
+        (status, headers.result())
       } finally {
         socket.close()
       }
@@ -324,10 +435,91 @@ object AzureDevOpsCredentialsPlugin extends AutoPlugin {
     }
   }
 
+  /** Send an unauthenticated HEAD request and return the response headers.
+    *
+    * Thin wrapper over [[headRequest]] for callers that only need headers
+    * (e.g. realm detection). Status-code consumers should use [[headRequest]]
+    * directly. */
+  private[chungmin] def headRequestHeaders(uri: URI): Seq[(String, String)] =
+    headRequest(uri, authHeader = None)._2
+
+  /** Enable HTTPS endpoint identification on a freshly-created
+    * [[javax.net.ssl.SSLSocket]] so the TLS handshake verifies the server's
+    * cert CN/SAN matches the URI's host. Returns the same socket reference
+    * for chaining.
+    *
+    * Extracted as a testable helper because a unit test for the underlying
+    * intent ("the socket asks for hostname verification") is much cleaner
+    * than spinning up a self-signed-cert HTTPS test server just to observe
+    * the resulting [[javax.net.ssl.SSLHandshakeException]] — the JDK already
+    * enforces the algorithm once it's set; we only need to assert the call
+    * site sets it. */
+  private[chungmin] def configureSslEndpointIdentification(socket: SSLSocket): SSLSocket = {
+    val params = socket.getSSLParameters
+    params.setEndpointIdentificationAlgorithm("HTTPS")
+    socket.setSSLParameters(params)
+    socket
+  }
+
+  /** Build the Basic auth header value (`"Basic <base64(user:pass)>"`)
+    * from a username/password pair. Pure helper, no I/O. */
+  private[chungmin] def basicAuthHeader(user: String, pass: String): String = {
+    val raw = s"$user:$pass".getBytes("UTF-8")
+    "Basic " + java.util.Base64.getEncoder.encodeToString(raw)
+  }
+
+  /** Normalize a raw mode string (from `-D`, sys.props, or the setting key) to
+    * one of the canonical lower-case values. Unknown / null / empty input
+    * falls back to the default (`"auto"`).
+    *
+    * Centralizes the lower-case + canonical-match logic so both the
+    * property-reader [[validateExistingCredentialsMode]] AND the
+    * [[CredentialsBuilder]] two-arg constructor go through the same
+    * normalization — preventing the case-sensitivity regression where the
+    * production wiring would silently degrade `-D...=NEVER` or
+    * `:= "Always"` to the auto branch. */
+  private[chungmin] def normalizeMode(value: String): String =
+    Option(value).map(_.toLowerCase) match {
+      case Some(ValidateAlways) => ValidateAlways
+      case Some(ValidateNever) => ValidateNever
+      case _ => ValidateAuto
+    }
+
+  /** Read [[ValidateExistingCredentialsProperty]] and normalize the value to
+    * one of `"auto" | "always" | "never"`. Unknown / null values fall back
+    * to the default (`"auto"`).
+    *
+    * Exposed for testability so the property-precedence logic is directly
+    * assertable; the setting key in [[autoImport]] writes through to this
+    * property, so a unit test that sets the property exercises the same
+    * code path the setting-key wiring uses. */
+  private[chungmin] def validateExistingCredentialsMode(): String =
+    normalizeMode(System.getProperty(ValidateExistingCredentialsProperty))
+
+
   // $COVERAGE-OFF$ sbt task wiring — exercised only inside a real sbt build, not unit-testable
   override lazy val projectSettings = Seq(
-    credentials ++= new CredentialsBuilder(streams.value.log)
-      .buildCredentials(credentials.value, externalResolvers.value),
+    // Route through validateExistingCredentialsMode so the default is
+    // normalized (lowercased, unknown → "auto"). Critical: without this,
+    // `-D...=NEVER` would land as raw "NEVER" in the setting value, pass
+    // straight into CredentialsBuilder(log, mode), and silently degrade to
+    // auto because the constants are lowercase.
+    azureDevOpsValidateExistingCredentials := validateExistingCredentialsMode(),
+
+    credentials ++= {
+      // Pass the mode VALUE directly into CredentialsBuilder. Using a JVM-wide
+      // System property as the bridge would race across the per-project credentials
+      // tasks in a multi-project build (sbt may evaluate them in any order, and the
+      // System property is global). Direct argument-passing gives each project's
+      // CredentialsBuilder the mode that was actually scoped to it.
+      //
+      // CredentialsBuilder's constructor re-normalizes mode so a user who sets
+      // `azureDevOpsValidateExistingCredentials := "ALWAYS"` directly in build.sbt
+      // (bypassing the projectSettings default above) still gets correct behavior.
+      val mode = azureDevOpsValidateExistingCredentials.value
+      new CredentialsBuilder(streams.value.log, mode)
+        .buildCredentials(credentials.value, externalResolvers.value)
+    },
 
     // Fix for https://github.com/coursier/coursier/issues/1649
     csrConfiguration := updateCoursierConf(
@@ -337,7 +529,17 @@ object AzureDevOpsCredentialsPlugin extends AutoPlugin {
   )
   // $COVERAGE-ON$
 
-  class CredentialsBuilder(log: Logger) {
+  class CredentialsBuilder(log: Logger, rawMode: String) {
+    // Normalize at construction time so all internal call sites can compare
+    // with `==` against the canonical lowercase constants without re-normalizing.
+    private val mode: String = AzureDevOpsCredentialsPlugin.normalizeMode(rawMode)
+
+    /** Backward-compat overload: reads the mode from
+      * [[ValidateExistingCredentialsProperty]] at construction time (preserves
+      * the single-arg constructor shape used by existing tests). */
+    def this(log: Logger) =
+      this(log, AzureDevOpsCredentialsPlugin.validateExistingCredentialsMode())
+
     def buildCredentials(
         existingCredentials: Seq[Credentials],
         resolvers: Seq[Resolver]): Seq[Credentials] = {
@@ -481,9 +683,19 @@ object AzureDevOpsCredentialsPlugin extends AutoPlugin {
             val uri = new URI(repo.root)
             val host = uri.getHost
             val (user, password) = server
-            getRealm(uri).map { realm =>
-              log.debug(s"creating credentials for realm=$realm, host=$host, user=$user")
-              Credentials(realm, host, user, password)
+            if (isStaleSettingsEntry(uri, host, user, password)) {
+              // Probe verdict + mode policy says drop. Returning None here
+              // means buildCredentialsWithAccessToken will see no entry for
+              // this host and generate a fresh Entra credential. The INFO
+              // log lives in [[isStaleSettingsEntry]] so the user sees
+              // exactly which entry was overridden, with the actionable
+              // remediation if Entra also fails.
+              None
+            } else {
+              getRealm(uri).map { realm =>
+                log.debug(s"creating credentials for realm=$realm, host=$host, user=$user")
+                Credentials(realm, host, user, password)
+              }
             }
           }.getOrElse {
             log.debug("matching <server> not found")
@@ -492,6 +704,196 @@ object AzureDevOpsCredentialsPlugin extends AutoPlugin {
       }.flatten
       log.debug(s"created ${credentials.size} credentials from settings.xml")
       credentials
+    }
+
+    // Per-builder cache of probe verdicts, keyed by the FULL feed URI string.
+    // Keying by URI (not just host) is required for correctness: ADO serves
+    // every org and every feed at the same host (`pkgs.dev.azure.com`, or
+    // multiple feeds under `<org>.pkgs.visualstudio.com/<project>/_packaging/`)
+    // so a host-keyed cache would let the first feed's verdict bleed into
+    // every other feed on the same host — silently trusting stale entries
+    // for feed B if feed A's PAT happened to be valid (the bug this PR is
+    // designed to fix), or silently dropping valid entries for feed A if
+    // feed B's PAT happened to be stale. Per-URI keeps the optimization
+    // (one probe per distinct feed URI within a single credentials-task
+    // evaluation — i.e. deduping when multiple resolvers in one project
+    // resolve to the same URI, and deduping concurrent first-touch when
+    // sbt evaluates the credentials task in parallel within that project)
+    // while making the verdict per-credential. ConcurrentHashMap +
+    // `computeIfAbsent` provides the concurrent-first-touch atomicity.
+    //
+    // The cache scope is per-builder, and `projectSettings` instantiates
+    // one builder per project's `credentials` task. An N-module sbt build
+    // that shares one feed across all modules will probe N times across
+    // the build (once per module) — sharing the cache across modules
+    // would require build-scope mutable state we deliberately don't
+    // introduce.
+    private val probeCache =
+      new java.util.concurrent.ConcurrentHashMap[String, java.lang.Boolean]()
+
+    /** Decide whether the settings.xml entry for `(uri, user, password)`
+      * should be dropped (returns `true` = "drop, fall through to Entra")
+      * or trusted (`false`).
+      *
+      * Honors the builder's `mode` (resolved at construction from
+      * [[ValidateExistingCredentialsProperty]] OR the build.sbt setting
+      * key [[autoImport.azureDevOpsValidateExistingCredentials]] — the
+      * setting key wins for per-project scoping):
+      *   - `never` → always trust (returns `false` without probing).
+      *   - `always` → probe; drop on 401, trust otherwise.
+      *   - `auto` (default) → probe; on 401 try Entra. If Entra is
+      *     unreachable, keep the entry and log an INFO line with `az
+      *     login` remediation. If Entra IS reachable, re-probe the feed
+      *     with the new token to verify it has feed access:
+      *     Bearer-probe non-401 → drop the entry (Entra path takes over);
+      *     Bearer-probe 401 → keep the entry and log an INFO line about
+      *     Entra-identity feed scope (common on Azure VMs whose Managed
+      *     Identity doesn't cover the user's feed). On a Bearer-probe
+      *     network error, take the optimistic-drop branch (treat as "not
+      *     401") rather than re-stranding the user with their stale PAT.
+      *
+      * Probe results are cached per URI for the builder's lifetime (see
+      * [[probeCache]] doc for why URI and not host).
+      * Non-ADO hosts and resolvers without a host (somehow) are never
+      * probed — trust them. Network errors during the probe are also
+      * trusted (assume transient, don't punish the user). */
+    private[chungmin] def isStaleSettingsEntry(
+        uri: URI, host: String, user: String, password: String): Boolean = {
+      if (mode == ValidateNever) return false
+      if (host == null || !AzureDevOpsCredentialsPlugin.isAzureDevOpsHost(host)) return false
+      // Defense-in-depth: never put PAT/Bearer on a cleartext wire. The TLS
+      // endpoint-identification fix (configureSslEndpointIdentification) only
+      // protects the `if scheme == "https"` branch in headRequest; if the
+      // resolver URI is `http://...`, the `else { rawSocket }` branch
+      // bypasses TLS entirely and Authorization headers would go on the wire
+      // in plaintext. ADO only serves HTTPS, so an `http://pkgs.dev.azure.com`
+      // resolver is almost certainly a typo — but the cost of defending is
+      // one line, and we'd rather trust the entry (legacy v0.0.9 behavior)
+      // than expose credentials. Skipping here keeps the probe path clean
+      // without affecting whatever the user's Aether/sbt fetch eventually
+      // does over the same `http://` URL.
+      if (uri.getScheme != "https") return false
+      probeCache.computeIfAbsent(uri.toString, _ =>
+        java.lang.Boolean.valueOf(probeAndDecideImpl(uri, host, user, password, mode))
+      ).booleanValue()
+    }
+
+    /** Probe `uri` with the supplied `mode` and decide whether the settings
+      * entry is stale. Returns `true` if the entry should be dropped (stale),
+      * `false` if it should be kept (trusted).
+      *
+      * Public-but-`protected[chungmin]` is intentional — it makes this method
+      * one of two test-injection seams used by the spec, depending on what the
+      * test wants to assert:
+      *
+      *  - Tests that want to assert the surrounding wiring (cache hits, mode
+      *    short-circuits, `isStaleSettingsEntry` host/scheme gates) override
+      *    `probeAndDecideImpl` itself with a canned outcome. The
+      *    "actually cache in the real implementation" test in
+      *    `CredentialsBuilderSpec.scala` is an example: it overrides this
+      *    method to return `true` and counts call sites, so the surrounding
+      *    `computeIfAbsent` is what's actually under test.
+      *  - Tests that want to assert THIS method's decision tree
+      *    (Basic-probe 401 → auto/always fork → Bearer-verify 401 → keep, etc.)
+      *    leave `probeAndDecideImpl` intact and instead override
+      *    [[probeWithBasic]] / [[probeWithBearer]] (their own Scaladoc explains
+      *    that seam separately). The `probeAndDecideImpl` decision-tree tests
+      *    in `CredentialsBuilderSpec.scala` use this pattern via
+      *    `stubProbeBuilder` — both the simple-decision tests (Basic-probe
+      *    only) and the auto-mode Bearer-verify tests live under that label.
+      *
+      * `mode` is passed explicitly as an argument (not read from the
+      * enclosing builder's `mode` field) so a test override of EITHER seam
+      * can assert decision-tree behaviour against an arbitrary mode value
+      * without constructing a separate builder per mode. Production's only
+      * call site (in [[isStaleSettingsEntry]]) passes the builder's `mode`
+      * field verbatim — do not collapse the parameter into a `this.mode`
+      * read without removing the test-injection seam, or the per-call mode
+      * argument silently stops mattering. */
+    protected[chungmin] def probeAndDecideImpl(
+        uri: URI, host: String, user: String, password: String, mode: String): Boolean = {
+      val status = probeWithBasic(uri, host, user, password)
+      status match {
+        case Some(401) =>
+          if (mode == ValidateAlways) {
+            log.info(
+              s"$host: settings.xml credentials returned 401; " +
+                "falling through to Entra token acquisition.")
+            true
+          } else {
+            // auto mode. Step 1: can we even acquire an Entra token?
+            getToken() match {
+              case None =>
+                log.info(
+                  s"$host: settings.xml credentials returned 401, but Entra is " +
+                    "also unreachable. Build will likely fail with 401. " +
+                    "Run `az login` or configure AZURE_CLIENT_ID to enable " +
+                    "automatic credential refresh.")
+                false
+              case Some(token) =>
+                // Step 2: does that token actually work against this feed? On
+                // hosts where Managed Identity is available (Azure VMs, App
+                // Service), getToken() succeeds even when AzureCli is
+                // unavailable — but the MI may not have access to the feed
+                // the user's PAT was scoped to. Overriding the user's stale
+                // PAT with a no-access MI token would leave the build still
+                // failing with 401, with a misleading "fell through to Entra"
+                // log line. Verify before override.
+                val entraStatus = probeWithBearer(uri, host, token)
+                if (entraStatus.contains(401)) {
+                  log.info(
+                    s"$host: settings.xml credentials returned 401, AND a fresh " +
+                      "Entra token also returned 401 against this feed. The " +
+                      "Entra identity in scope (Azure CLI / env vars / Managed " +
+                      "Identity) may not have access to this feed. Try `az login` " +
+                      "as a user with feed access, or check role assignments.")
+                  false
+                } else {
+                  log.info(
+                    s"$host: settings.xml credentials returned 401; " +
+                      "falling through to Entra token acquisition.")
+                  true
+                }
+            }
+          }
+        case _ =>
+          // 200 / 404 / network error / unparseable status: trust the entry.
+          // (Most ADO feed roots return 404 to a HEAD with valid Entra
+          // bearer — we cannot distinguish "auth worked" from "feed deleted"
+          // by status alone, so we don't try; this feature's scope is
+          // specifically the stale-credential case.)
+          false
+      }
+    }
+
+    /** Probe `uri` with HTTP Basic auth derived from `user`/`password` and
+      * return the response status. Exposed as a test seam: overriding this
+      * lets a test inject specific Basic-probe outcomes (e.g. 401, 200,
+      * `None` for network error) without driving a real socket through
+      * [[headRequest]] — important because [[headRequest]] now refuses
+      * Authorization headers on non-https URIs, so the easy fake-server
+      * pattern of `http://localhost:$port/` can no longer hit the probe
+      * path end-to-end. */
+    protected[chungmin] def probeWithBasic(
+        uri: URI, host: String, user: String, password: String): Option[Int] = {
+      val auth = AzureDevOpsCredentialsPlugin.basicAuthHeader(user, password)
+      try AzureDevOpsCredentialsPlugin.headRequest(uri, Some(auth))._1
+      catch {
+        case NonFatal(e) =>
+          log.debug(s"probe of $host (Basic) failed with $e; trusting existing credentials")
+          None
+      }
+    }
+
+    /** Probe `uri` with HTTP Bearer auth and return the response status.
+      * Same test-seam rationale as [[probeWithBasic]]. */
+    protected[chungmin] def probeWithBearer(uri: URI, host: String, token: String): Option[Int] = {
+      try AzureDevOpsCredentialsPlugin.headRequest(uri, Some(s"Bearer $token"))._1
+      catch {
+        case NonFatal(e) =>
+          log.debug(s"verification probe of $host (Bearer) failed with $e; assuming token works")
+          None
+      }
     }
   }
 
