@@ -1002,28 +1002,26 @@ class CredentialsBuilderSpec extends AnyFlatSpec with Matchers with BeforeAndAft
   // (passed into testBuilder) stubs isStaleSettingsEntry wholesale; the real
   // probeAndDecideImpl decision tree has its own dedicated tests below.
   "buildCredentialsFromMavenSettings probe" should
-      "drop the settings entry when the local probe server returns 401 in 'always' mode" in {
-    withValidationMode(Some("always")) {
-      // Need a resolver pointed at a real-but-ADO-shaped host: use a real
-      // ADO URL whose root we don't actually hit (the override below skips
-      // the network). The key is exercising buildCredentialsFromMavenSettings'
-      // new probe branch.
-      val settings = writeSettings(
-        """<?xml version="1.0"?>
-          |<settings><servers><server>
-          |  <id>AzureDevOps</id><username>u</username><password>bad-pat</password>
-          |</server></servers></settings>""".stripMargin)
-      val resolver = MavenRepository("AzureDevOps", AdoFeedUrl)
-      // Use testBuilder with a stale function that simulates probe=401-always-drop.
-      val builder = testBuilder(
-        settings = settings,
-        stale = (_, _, _, _) => true)
-      val result = builder.buildCredentials(Seq.empty, Seq(resolver))
-      // The settings entry was dropped, and buildCredentialsWithAccessToken
-      // generated an Entra cred for the host (with userName from URL parsing).
-      val users = result.collect { case c: DirectCredentials => c.userName }
-      users shouldBe Seq("myorg")
-    }
+      "drop the settings entry when stale function returns true" in {
+    // Use a resolver pointed at a real-but-ADO-shaped host so the wiring
+    // accepts it; the override below skips the network. The key is exercising
+    // buildCredentialsFromMavenSettings' new probe branch (which calls
+    // isStaleSettingsEntry unconditionally — mode handling lives inside that
+    // method, so this test does not need to pin a specific validation mode).
+    val settings = writeSettings(
+      """<?xml version="1.0"?>
+        |<settings><servers><server>
+        |  <id>AzureDevOps</id><username>u</username><password>bad-pat</password>
+        |</server></servers></settings>""".stripMargin)
+    val resolver = MavenRepository("AzureDevOps", AdoFeedUrl)
+    val builder = testBuilder(
+      settings = settings,
+      stale = (_, _, _, _) => true)
+    val result = builder.buildCredentials(Seq.empty, Seq(resolver))
+    // The settings entry was dropped, and buildCredentialsWithAccessToken
+    // generated an Entra cred for the host (with userName from URL parsing).
+    val users = result.collect { case c: DirectCredentials => c.userName }
+    users shouldBe Seq("myorg")
   }
 
   it should "keep the settings entry when stale function returns false" in {
