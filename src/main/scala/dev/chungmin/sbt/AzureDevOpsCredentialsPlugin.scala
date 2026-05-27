@@ -347,11 +347,16 @@ object AzureDevOpsCredentialsPlugin extends AutoPlugin {
     * response status code (parsed from the first line) and the response
     * headers.
     *
-    * Uses a raw socket instead of HttpURLConnection to avoid triggering
-    * sbt's global IvyAuthenticator (which logs spurious "Unable to find
-    * credentials" errors on 401) AND to keep the Authorization header
-    * from being logged by Aether/sbt's HTTP transport layer — a
-    * non-trivial PAT-leakage hazard since 0.0.9 added the probe path.
+    * Uses a raw socket instead of HttpURLConnection for two reasons:
+    *
+    *  - To avoid triggering sbt's global IvyAuthenticator (which logs
+    *    spurious "Unable to find credentials" errors on 401) — this
+    *    motivated the original v0.0.9 helper that only sent
+    *    unauthenticated realm-detection probes.
+    *  - To keep the Authorization header from being logged by Aether/sbt's
+    *    HTTP transport layer — a non-trivial PAT-leakage hazard introduced
+    *    in v0.0.10 when this helper started carrying PAT/Bearer credentials
+    *    for the authenticated-probe path.
     *
     * The authorization header (if provided) is set exactly once and never
     * re-sent on a redirect (we don't follow them — the response line is
