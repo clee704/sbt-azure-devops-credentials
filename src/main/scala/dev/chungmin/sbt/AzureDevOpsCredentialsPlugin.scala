@@ -536,7 +536,7 @@ object AzureDevOpsCredentialsPlugin extends AutoPlugin {
 
     /** Backward-compat overload: reads the mode from
       * [[ValidateExistingCredentialsProperty]] at construction time (preserves
-      * the v0.0.10 internal-API shape used by tests). */
+      * the single-arg constructor shape used by existing tests). */
     def this(log: Logger) =
       this(log, AzureDevOpsCredentialsPlugin.validateExistingCredentialsMode())
 
