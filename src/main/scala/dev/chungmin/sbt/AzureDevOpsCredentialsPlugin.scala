@@ -324,6 +324,21 @@ object AzureDevOpsCredentialsPlugin extends AutoPlugin {
     else if (uri.getScheme == "https") 443
     else 80
 
+  /** Build the HTTP/1.1 HEAD request line + headers as a single string,
+    * ready to write to the socket. Pure helper (no I/O) so the request
+    * shape is directly unit-testable — verifying via [[headRequest]]
+    * end-to-end would require an actual round-trip, and the auth-on-wire
+    * positive case can't run over plain TCP after the
+    * `https`-required guard on [[headRequest]].
+    *
+    * Format: `HEAD <path> HTTP/1.1\r\nHost: <host>\r\n[Authorization: <auth>\r\n]Connection: close\r\n\r\n`.
+    * The Authorization line is included iff `authHeader` is `Some(...)`. */
+  private[chungmin] def buildHeadRequestLine(
+      host: String, path: String, authHeader: Option[String]): String = {
+    val authLine = authHeader.map(h => s"Authorization: $h\r\n").getOrElse("")
+    s"HEAD $path HTTP/1.1\r\nHost: $host\r\n${authLine}Connection: close\r\n\r\n"
+  }
+
   /** Send a HEAD request with optional credentials and return both the
     * response status code (parsed from the first line) and the response
     * headers.
@@ -336,9 +351,23 @@ object AzureDevOpsCredentialsPlugin extends AutoPlugin {
     *
     * The authorization header (if provided) is set exactly once and never
     * re-sent on a redirect (we don't follow them — the response line is
-    * read and returned verbatim). */
+    * read and returned verbatim).
+    *
+    * **Defense-in-depth on cleartext credentials.** When `authHeader` is
+    * `Some(...)` and `uri.getScheme` is not `"https"`, throws
+    * `IllegalArgumentException` before opening the socket — preventing
+    * any future caller (refactor, new probe helper, etc.) from accidentally
+    * writing the Authorization header over a plain-TCP wire. The
+    * `isStaleSettingsEntry` entry-point guard at the call site short-
+    * circuits the same case for the production probe path; this guard is
+    * the second gate, so the comment claim "defense-in-depth" is literally
+    * two gates instead of one. */
   private[chungmin] def headRequest(
       uri: URI, authHeader: Option[String]): (Option[Int], Seq[(String, String)]) = {
+    require(
+      authHeader.isEmpty || uri.getScheme == "https",
+      s"headRequest with an Authorization header requires an https URI; got ${uri.getScheme}://${uri.getHost} " +
+        "(refusing to write credentials over a plain-TCP wire)")
     val host = uri.getHost
     val port = defaultPort(uri)
     val path = Option(uri.getRawPath).filter(_.nonEmpty).getOrElse("/")
@@ -366,9 +395,7 @@ object AzureDevOpsCredentialsPlugin extends AutoPlugin {
       try {
         val writer = new BufferedWriter(
           new OutputStreamWriter(socket.getOutputStream, "UTF-8"))
-        val authLine = authHeader.map(h => s"Authorization: $h\r\n").getOrElse("")
-        writer.write(
-          s"HEAD $path HTTP/1.1\r\nHost: $host\r\n${authLine}Connection: close\r\n\r\n")
+        writer.write(buildHeadRequestLine(host, path, authHeader))
         writer.flush()
         val reader = new BufferedReader(
           new InputStreamReader(socket.getInputStream, "UTF-8"))
@@ -805,7 +832,15 @@ object AzureDevOpsCredentialsPlugin extends AutoPlugin {
       }
     }
 
-    private def probeWithBasic(
+    /** Probe `uri` with HTTP Basic auth derived from `user`/`password` and
+      * return the response status. Exposed as a test seam: overriding this
+      * lets a test inject specific Basic-probe outcomes (e.g. 401, 200,
+      * `None` for network error) without driving a real socket through
+      * [[headRequest]] — important because [[headRequest]] now refuses
+      * Authorization headers on non-https URIs, so the easy fake-server
+      * pattern of `http://localhost:$port/` can no longer hit the probe
+      * path end-to-end. */
+    protected[chungmin] def probeWithBasic(
         uri: URI, host: String, user: String, password: String): Option[Int] = {
       val auth = AzureDevOpsCredentialsPlugin.basicAuthHeader(user, password)
       try AzureDevOpsCredentialsPlugin.headRequest(uri, Some(auth))._1
@@ -816,7 +851,9 @@ object AzureDevOpsCredentialsPlugin extends AutoPlugin {
       }
     }
 
-    private def probeWithBearer(uri: URI, host: String, token: String): Option[Int] = {
+    /** Probe `uri` with HTTP Bearer auth and return the response status.
+      * Same test-seam rationale as [[probeWithBasic]]. */
+    protected[chungmin] def probeWithBearer(uri: URI, host: String, token: String): Option[Int] = {
       try AzureDevOpsCredentialsPlugin.headRequest(uri, Some(s"Bearer $token"))._1
       catch {
         case NonFatal(e) =>

@@ -804,31 +804,65 @@ class CredentialsBuilderSpec extends AnyFlatSpec with Matchers with BeforeAndAft
     }
   }
 
-  it should "send the Authorization header verbatim when provided" in {
-    // Echo the request back so we can verify the Authorization line is on the wire.
-    val server = new ServerSocket(0)
-    @volatile var received: String = ""
-    try {
-      val port = server.getLocalPort
-      val t = new Thread(() => {
-        try {
-          val client = server.accept()
-          try {
-            val buf = new Array[Byte](2048)
-            val n = client.getInputStream.read(buf)
-            received = new String(buf, 0, n, "UTF-8")
-            val w = new BufferedWriter(new OutputStreamWriter(client.getOutputStream, "UTF-8"))
-            w.write("HTTP/1.1 401 Unauthorized\r\n\r\n")
-            w.flush()
-          } finally client.close()
-        } catch { case NonFatal(_) => () }
-      })
-      t.setDaemon(true); t.start()
-      val uri = new URI(s"http://localhost:$port/")
+  it should "throw IllegalArgumentException when authHeader is set but scheme is not https (defense-in-depth)" in {
+    // The cleartext-credential guard: future callers that try to send an
+    // Authorization header over a non-https URI must hard-fail, not silently
+    // leak credentials over plain TCP. The production probe path
+    // short-circuits this case earlier via isStaleSettingsEntry's
+    // scheme-check, but the guard here is the second gate — so a future
+    // refactor that introduces a new caller (or removes the entry-point
+    // guard) cannot regress to writing Authorization in cleartext without
+    // tripping this require().
+    val uri = new URI("http://example.com/")
+    val ex = intercept[IllegalArgumentException] {
       AzureDevOpsCredentialsPlugin.headRequest(uri, Some("Basic abcdef"))
-      t.join(5000)
-    } finally server.close()
-    received should include ("Authorization: Basic abcdef\r\n")
+    }
+    ex.getMessage should include ("https")
+  }
+
+  it should "allow Authorization header when scheme is https (require does not fire)" in {
+    // Verifies the require's positive branch: https URI + auth is allowed
+    // through (whether the actual TLS handshake succeeds is irrelevant —
+    // we only care that the require itself does not trip). The connect
+    // is expected to fail (host:port unreachable for the bogus URI), which
+    // is a non-IllegalArgumentException — exactly the contract we want.
+    val uri = new URI("https://localhost:1/")
+    intercept[Exception] {
+      AzureDevOpsCredentialsPlugin.headRequest(uri, Some("Basic abcdef"))
+    } shouldBe a [java.io.IOException]
+  }
+
+  "buildHeadRequestLine" should "produce a HEAD line with Host and the Authorization header when provided" in {
+    val req = AzureDevOpsCredentialsPlugin.buildHeadRequestLine(
+      host = "pkgs.dev.azure.com",
+      path = "/myorg/_packaging/myfeed/maven/v1",
+      authHeader = Some("Basic QWxhZGRpbjpPcGVuU2VzYW1l"))
+    req shouldBe
+      "HEAD /myorg/_packaging/myfeed/maven/v1 HTTP/1.1\r\n" +
+      "Host: pkgs.dev.azure.com\r\n" +
+      "Authorization: Basic QWxhZGRpbjpPcGVuU2VzYW1l\r\n" +
+      "Connection: close\r\n\r\n"
+  }
+
+  it should "produce a HEAD line WITHOUT the Authorization header when None" in {
+    val req = AzureDevOpsCredentialsPlugin.buildHeadRequestLine(
+      host = "pkgs.dev.azure.com",
+      path = "/",
+      authHeader = None)
+    req shouldBe
+      "HEAD / HTTP/1.1\r\n" +
+      "Host: pkgs.dev.azure.com\r\n" +
+      "Connection: close\r\n\r\n"
+  }
+
+  it should "produce a HEAD line with the Bearer token when provided" in {
+    val req = AzureDevOpsCredentialsPlugin.buildHeadRequestLine(
+      host = "pkgs.dev.azure.com",
+      path = "/myorg/_packaging/myfeed/maven/v1",
+      authHeader = Some("Bearer eyJhbGciOiJSUzI1NiJ9.fake.token"))
+    req should include ("Authorization: Bearer eyJhbGciOiJSUzI1NiJ9.fake.token\r\n")
+    req should startWith ("HEAD /myorg/_packaging/myfeed/maven/v1 HTTP/1.1\r\n")
+    req should endWith ("Connection: close\r\n\r\n")
   }
 
   it should "return None as status when the status line is malformed" in {
@@ -1116,107 +1150,102 @@ class CredentialsBuilderSpec extends AnyFlatSpec with Matchers with BeforeAndAft
     }
   }
 
-  // ─── probeAndDecide (real network probe via local server) ──────────────
+  // ─── probeAndDecide decision-tree tests ────────────────────────────────
 
-  // These tests exercise the actual probeAndDecide implementation by routing
-  // it at a local server. Because isAzureDevOpsHost filters non-ADO hosts,
-  // we test probeAndDecide directly (rather than through isStaleSettingsEntry).
+  // These exercise probeAndDecideImpl's branching logic directly, using
+  // stubbed probeWithBasic / probeWithBearer values. The headRequest
+  // wire-format and TLS-endpoint-ID invariants are verified by their
+  // dedicated tests above.
 
   "probeAndDecide" should "return false (trust) when network probe returns 200" in {
-    withRawHeadServer("HTTP/1.1 200 OK\r\n\r\n") { (host, port) =>
-      val builder = new AzureDevOpsCredentialsPlugin.CredentialsBuilder(nullLog)
-      val uri = new URI(s"http://$host:$port/")
-      builder.probeAndDecideImpl(
-        uri, host, "u", "p",
-        AzureDevOpsCredentialsPlugin.ValidateAlways) shouldBe false
-    }
+    val builder = stubProbeBuilder(
+      basicStatus = Some(200), bearerStatus = None, tokenValue = "n/a")
+    val uri = new URI("https://pkgs.dev.azure.com/o/p/_packaging/f/maven/v1")
+    builder.probeAndDecideImpl(
+      uri, "pkgs.dev.azure.com", "u", "p",
+      AzureDevOpsCredentialsPlugin.ValidateAlways) shouldBe false
   }
 
   it should "return true (drop) when network probe returns 401 in 'always' mode" in {
-    withRawHeadServer("HTTP/1.1 401 Unauthorized\r\n\r\n") { (host, port) =>
-      val builder = new AzureDevOpsCredentialsPlugin.CredentialsBuilder(nullLog)
-      val uri = new URI(s"http://$host:$port/")
-      builder.probeAndDecideImpl(
-        uri, host, "u", "p",
-        AzureDevOpsCredentialsPlugin.ValidateAlways) shouldBe true
-    }
+    val builder = stubProbeBuilder(
+      basicStatus = Some(401), bearerStatus = None, tokenValue = "n/a")
+    val uri = new URI("https://pkgs.dev.azure.com/o/p/_packaging/f/maven/v1")
+    builder.probeAndDecideImpl(
+      uri, "pkgs.dev.azure.com", "u", "p",
+      AzureDevOpsCredentialsPlugin.ValidateAlways) shouldBe true
   }
 
   it should "return true (drop) when probe is 401 + auto + Entra works" in {
-    withRawHeadServer("HTTP/1.1 401 Unauthorized\r\n\r\n") { (host, port) =>
-      val builder = new AzureDevOpsCredentialsPlugin.CredentialsBuilder(nullLog) {
-        override protected def newCredential(): TokenCredential = credentialReturning("entra")
-      }
-      val uri = new URI(s"http://$host:$port/")
-      builder.probeAndDecideImpl(
-        uri, host, "u", "p",
-        AzureDevOpsCredentialsPlugin.ValidateAuto) shouldBe true
-    }
+    val builder = stubProbeBuilder(
+      basicStatus = Some(401),
+      bearerStatus = Some(200),  // verify probe says the new token has access
+      tokenValue = "entra")
+    val uri = new URI("https://pkgs.dev.azure.com/o/p/_packaging/f/maven/v1")
+    builder.probeAndDecideImpl(
+      uri, "pkgs.dev.azure.com", "u", "p",
+      AzureDevOpsCredentialsPlugin.ValidateAuto) shouldBe true
   }
 
   it should "return false (keep) when probe is 401 + auto + Entra unreachable" in {
-    withRawHeadServer("HTTP/1.1 401 Unauthorized\r\n\r\n") { (host, port) =>
-      val builder = new AzureDevOpsCredentialsPlugin.CredentialsBuilder(nullLog) {
-        override protected def newCredential(): TokenCredential =
-          fakeCredential(Mono.error[AccessToken](new RuntimeException("no az")))
-      }
-      val uri = new URI(s"http://$host:$port/")
-      builder.probeAndDecideImpl(
-        uri, host, "u", "p",
-        AzureDevOpsCredentialsPlugin.ValidateAuto) shouldBe false
+    val builder = new AzureDevOpsCredentialsPlugin.CredentialsBuilder(nullLog) {
+      override protected def newCredential(): TokenCredential =
+        fakeCredential(Mono.error[AccessToken](new RuntimeException("no az")))
+      override protected[chungmin] def probeWithBasic(
+          uri: URI, host: String, user: String, password: String): Option[Int] = Some(401)
+      // probeWithBearer is unreachable here (getToken returns None first); leave default
     }
+    val uri = new URI("https://pkgs.dev.azure.com/o/p/_packaging/f/maven/v1")
+    builder.probeAndDecideImpl(
+      uri, "pkgs.dev.azure.com", "u", "p",
+      AzureDevOpsCredentialsPlugin.ValidateAuto) shouldBe false
   }
 
   it should "return false (trust) when probe throws a network error" in {
-    val builder = new AzureDevOpsCredentialsPlugin.CredentialsBuilder(nullLog)
-    val uri = new URI("http://localhost:1/never-routable")  // port 1: nothing listening
+    val builder = stubProbeBuilder(
+      basicStatus = None, bearerStatus = None, tokenValue = "n/a")
+    val uri = new URI("https://pkgs.dev.azure.com/o/p/_packaging/f/maven/v1")
     builder.probeAndDecideImpl(
-      uri, "localhost", "u", "p",
+      uri, "pkgs.dev.azure.com", "u", "p",
       AzureDevOpsCredentialsPlugin.ValidateAlways) shouldBe false
   }
 
   // ─── auto-mode Bearer verification (bug-1 fix: re-probe with Entra token) ───
 
-  /** Local server that serves N canned responses in sequence (one per accepted
-    * connection), so a probeAndDecideImpl call can be observed across BOTH
-    * the initial Basic probe AND the post-acquisition Bearer verification. */
-  private def withSequentialServers(responses: Seq[String])(test: (String, Int) => Unit): Unit = {
-    val server = new ServerSocket(0)
-    try {
-      val port = server.getLocalPort
-      val t = new Thread(() => {
-        try {
-          responses.foreach { resp =>
-            val client = server.accept()
-            try {
-              val buf = new Array[Byte](2048)
-              client.getInputStream.read(buf)
-              val w = new BufferedWriter(new OutputStreamWriter(client.getOutputStream, "UTF-8"))
-              w.write(resp); w.flush()
-            } finally client.close()
-          }
-        } catch { case NonFatal(_) => () }
-      })
-      t.setDaemon(true); t.start()
-      test("localhost", port)
-      t.join(5000)
-    } finally server.close()
-  }
+  /** Test helper: build a CredentialsBuilder whose probeWithBasic /
+    * probeWithBearer return canned `Option[Int]` values, and whose
+    * newCredential returns a fixed token string. Lets the bug-1 / bug-2
+    * tests assert probeAndDecideImpl's decision tree directly against
+    * specific (Basic-probe, Bearer-probe) outcome combinations, without
+    * driving any actual network round-trip — `headRequest` now refuses
+    * to send Authorization headers over http:// URIs, so the previous
+    * `withSequentialServers + http://localhost:$port/` pattern can no
+    * longer hit the probe path. Stubbing the probe helpers (the boundary
+    * just above `headRequest`) keeps these tests focused on the decision
+    * logic. The `headRequest` wire-format and TLS-endpoint-ID
+    * invariants have their own dedicated tests above. */
+  private def stubProbeBuilder(
+      basicStatus: Option[Int],
+      bearerStatus: Option[Int],
+      tokenValue: String
+  ): AzureDevOpsCredentialsPlugin.CredentialsBuilder =
+    new AzureDevOpsCredentialsPlugin.CredentialsBuilder(nullLog) {
+      override protected def newCredential(): TokenCredential = credentialReturning(tokenValue)
+      override protected[chungmin] def probeWithBasic(
+          uri: URI, host: String, user: String, password: String): Option[Int] = basicStatus
+      override protected[chungmin] def probeWithBearer(
+          uri: URI, host: String, token: String): Option[Int] = bearerStatus
+    }
 
   "probeAndDecide (auto, Entra works, Bearer probe succeeds)" should
       "return true (drop entry) when the verification probe doesn't get 401" in {
-    withSequentialServers(Seq(
-      "HTTP/1.1 401 Unauthorized\r\n\r\n",
-      "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n"
-    )) { (host, port) =>
-      val builder = new AzureDevOpsCredentialsPlugin.CredentialsBuilder(nullLog) {
-        override protected def newCredential(): TokenCredential = credentialReturning("ok-token")
-      }
-      val uri = new URI(s"http://$host:$port/")
-      builder.probeAndDecideImpl(
-        uri, host, "u", "p",
-        AzureDevOpsCredentialsPlugin.ValidateAuto) shouldBe true
-    }
+    val builder = stubProbeBuilder(
+      basicStatus = Some(401),
+      bearerStatus = Some(200),
+      tokenValue = "ok-token")
+    val uri = new URI("https://pkgs.dev.azure.com/o/p/_packaging/f/maven/v1")
+    builder.probeAndDecideImpl(
+      uri, "pkgs.dev.azure.com", "u", "p",
+      AzureDevOpsCredentialsPlugin.ValidateAuto) shouldBe true
   }
 
   "probeAndDecide (auto, Entra works, Bearer probe ALSO 401)" should
@@ -1228,38 +1257,32 @@ class CredentialsBuilderSpec extends AnyFlatSpec with Matchers with BeforeAndAft
     // failing, with a misleading "fell through to Entra" log line. The fix:
     // verify the new token's access first, fall back to keeping the stale
     // entry with a clearer diagnostic.
-    withSequentialServers(Seq(
-      "HTTP/1.1 401 Unauthorized\r\n\r\n",
-      "HTTP/1.1 401 Unauthorized\r\n\r\n"
-    )) { (host, port) =>
-      val builder = new AzureDevOpsCredentialsPlugin.CredentialsBuilder(nullLog) {
-        override protected def newCredential(): TokenCredential =
-          credentialReturning("no-access-token")
-      }
-      val uri = new URI(s"http://$host:$port/")
-      builder.probeAndDecideImpl(
-        uri, host, "u", "p",
-        AzureDevOpsCredentialsPlugin.ValidateAuto) shouldBe false
-    }
+    val builder = stubProbeBuilder(
+      basicStatus = Some(401),
+      bearerStatus = Some(401),
+      tokenValue = "no-access-token")
+    val uri = new URI("https://pkgs.dev.azure.com/o/p/_packaging/f/maven/v1")
+    builder.probeAndDecideImpl(
+      uri, "pkgs.dev.azure.com", "u", "p",
+      AzureDevOpsCredentialsPlugin.ValidateAuto) shouldBe false
   }
 
   "probeAndDecide (auto, Bearer verify network error)" should
       "assume token works (return true, drop entry) — be optimistic on transient blip" in {
-    // First request answered with 401 (stale Basic probe); the helper server is
-    // single-shot, so the second request (Bearer verify) gets a connect failure.
-    // probeWithBearer catches IOException, returns None; isStaleSettingsEntry
-    // treats None as "not 401" → take the optimistic success branch. This is
-    // a deliberate UX choice: a transient blip on the verify probe shouldn't
-    // re-strand the user with their already-stale PAT.
-    withRawHeadServer("HTTP/1.1 401 Unauthorized\r\n\r\n") { (host, port) =>
-      val builder = new AzureDevOpsCredentialsPlugin.CredentialsBuilder(nullLog) {
-        override protected def newCredential(): TokenCredential = credentialReturning("token")
-      }
-      val uri = new URI(s"http://$host:$port/")
-      builder.probeAndDecideImpl(
-        uri, host, "u", "p",
-        AzureDevOpsCredentialsPlugin.ValidateAuto) shouldBe true
-    }
+    // Basic probe answered with 401 (stale); Bearer-verify fails with a
+    // network error (probeWithBearer catches the IOException and returns
+    // None). probeAndDecideImpl treats None as "not 401" → take the
+    // optimistic success branch. Deliberate UX choice: a transient blip
+    // on the verify probe shouldn't re-strand the user with their already-
+    // stale PAT.
+    val builder = stubProbeBuilder(
+      basicStatus = Some(401),
+      bearerStatus = None,
+      tokenValue = "token")
+    val uri = new URI("https://pkgs.dev.azure.com/o/p/_packaging/f/maven/v1")
+    builder.probeAndDecideImpl(
+      uri, "pkgs.dev.azure.com", "u", "p",
+      AzureDevOpsCredentialsPlugin.ValidateAuto) shouldBe true
   }
 
   // ─── CredentialsBuilder(log, mode) constructor (bug-2 fix) ─────────────
