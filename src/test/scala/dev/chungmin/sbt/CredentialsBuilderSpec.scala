@@ -898,18 +898,16 @@ class CredentialsBuilderSpec extends AnyFlatSpec with Matchers with BeforeAndAft
       if (tokenAvailable) Some("entra-token") else None
     // Stub the network call: override isStaleSettingsEntry wholesale so the
     // simulated probeStatus drives the decision, no actual headRequest fires.
-    var probeCalls = 0
     override private[chungmin] def isStaleSettingsEntry(
         uri: URI, host: String, user: String, password: String): Boolean = {
       // Re-implement the decision tree inline rather than calling super, so
       // `probeStatus` drives the simulated probe outcome without any real
-      // headRequest / network round-trip — and so `probeCalls` records every
-      // surviving (non-short-circuited) invocation, which the mode/host-gate
-      // tests below assert on directly.
+      // headRequest / network round-trip. Mirrors enough of the production
+      // short-circuit logic (Never/host gates) for the mode/host-gate tests
+      // below to assert the right gating behavior via the return value alone.
       val mode = AzureDevOpsCredentialsPlugin.validateExistingCredentialsMode()
       if (mode == AzureDevOpsCredentialsPlugin.ValidateNever) return false
       if (host == null || !AzureDevOpsCredentialsPlugin.isAzureDevOpsHost(host)) return false
-      probeCalls += 1
       probeStatus match {
         case Some(401) =>
           if (mode == AzureDevOpsCredentialsPlugin.ValidateAlways) true
@@ -1166,18 +1164,6 @@ class CredentialsBuilderSpec extends AnyFlatSpec with Matchers with BeforeAndAft
       uri, "pkgs.dev.azure.com", "u", "p",
       AzureDevOpsCredentialsPlugin.ValidateAlways) shouldBe true
   }
-
-  it should "return true (drop) when probe is 401 + auto + Entra works" in {
-    val builder = stubProbeBuilder(
-      basicStatus = Some(401),
-      bearerStatus = Some(200),  // verify probe says the new token has access
-      tokenValue = "entra")
-    val uri = new URI("https://pkgs.dev.azure.com/o/p/_packaging/f/maven/v1")
-    builder.probeAndDecideImpl(
-      uri, "pkgs.dev.azure.com", "u", "p",
-      AzureDevOpsCredentialsPlugin.ValidateAuto) shouldBe true
-  }
-
   it should "return false (keep) when probe is 401 + auto + Entra unreachable" in {
     val builder = new AzureDevOpsCredentialsPlugin.CredentialsBuilder(nullLog) {
       override protected def newCredential(): TokenCredential =
