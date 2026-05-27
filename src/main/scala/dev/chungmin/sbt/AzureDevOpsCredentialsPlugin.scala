@@ -79,15 +79,19 @@ object AzureDevOpsCredentialsPlugin extends AutoPlugin {
     *
     * Values (case-insensitive):
     *
-    *   - `"auto"` (default): probe each entry with a HEAD request; if the
-    *     feed returns 401 AND Entra acquisition succeeds, drop the entry and
-    *     fall through to the Entra path. If Entra is unreachable, keep the
-    *     stale entry and log an INFO line — same outcome as the legacy
-    *     behavior, but with diagnostic signal.
-    *   - `"always"`: probe; on 401, drop unconditionally (Entra's failure
-    *     becomes the user-visible error if it can't acquire either).
+    *   - `"auto"` (default): probe each entry; on a 401, try Entra and
+    *     verify the new token actually has feed access before dropping the
+    *     entry. Falls back to keeping the entry with diagnostic INFO logs
+    *     when Entra is unreachable or the verified token lacks feed scope.
+    *   - `"always"`: probe; on 401, drop unconditionally (no Entra-side
+    *     verification — Entra's eventual failure becomes the user-visible
+    *     error if it can't acquire a working token either).
     *   - `"never"`: legacy behavior — trust settings.xml entries
-    *     unconditionally.
+    *     unconditionally, without probing.
+    *
+    * See [[CredentialsBuilder.isStaleSettingsEntry]] for the full
+    * branch-by-branch decision tree (the central authority on per-branch
+    * behavior; the natural place for future Bearer-verify changes to land).
     *
     * Configurable as `-D` JVM property, in `.jvmopts`, or via `SBT_OPTS`.
     * The `build.sbt` setting [[autoImport.azureDevOpsValidateExistingCredentials]]
