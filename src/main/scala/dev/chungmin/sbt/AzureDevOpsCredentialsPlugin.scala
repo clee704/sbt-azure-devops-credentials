@@ -756,26 +756,31 @@ object AzureDevOpsCredentialsPlugin extends AutoPlugin {
       // does over the same `http://` URL.
       if (uri.getScheme != "https") return false
       probeCache.computeIfAbsent(uri.toString, _ =>
-        java.lang.Boolean.valueOf(probeAndDecide(uri, host, user, password, mode))
+        java.lang.Boolean.valueOf(probeAndDecideImpl(uri, host, user, password, mode))
       ).booleanValue()
     }
 
-    private def probeAndDecide(
-        uri: URI, host: String, user: String, password: String, mode: String): Boolean =
-      probeAndDecideImpl(uri, host, user, password, mode)
-
-    /** Test seam for [[probeAndDecide]]. Production binds to a thin proxy of
-      * the real implementation; tests override this to inject specific probe
-      * outcomes and assert call counts (e.g. cache-hit verification).
+    /** Probe `uri` with the supplied `mode` and decide whether the settings
+      * entry is stale. Returns `true` if the entry should be dropped (stale),
+      * `false` if it should be kept (trusted).
       *
-      * `mode` is passed explicitly as an argument (not read from the enclosing
-      * builder's `mode` field) so a test can override `probeAndDecideImpl`
-      * and assert decision-tree behaviour against an arbitrary mode without
-      * constructing a new builder per mode. Production's only call site
-      * (in [[isStaleSettingsEntry]]) passes the builder's `mode` field
-      * verbatim — do not collapse the parameter into a `this.mode` read
-      * without removing the test-injection seam, or the indirection silently
-      * stops mattering. */
+      * Public-but-`protected[chungmin]` is intentional: the suffix `Impl` and
+      * the visibility are the test-injection seam. Tests in
+      * `dev.chungmin.sbt` override this method to inject specific
+      * `(probeWithBasic, probeWithBearer)` outcomes and assert the
+      * decision-tree branches in isolation — for example, `probeAndDecide
+      * (auto, Entra works, Bearer probe ALSO 401)` overrides this with a
+      * canned `false` to bypass the real probe while exercising the
+      * surrounding `isStaleSettingsEntry` flow.
+      *
+      * `mode` is passed explicitly as an argument (not read from the
+      * enclosing builder's `mode` field) so a test override can assert
+      * decision-tree behaviour against an arbitrary mode value without
+      * constructing a separate builder per mode. Production's only call
+      * site (in [[isStaleSettingsEntry]]) passes the builder's `mode`
+      * field verbatim — do not collapse the parameter into a `this.mode`
+      * read without removing the test-injection seam, or the per-call mode
+      * argument silently stops mattering. */
     protected[chungmin] def probeAndDecideImpl(
         uri: URI, host: String, user: String, password: String, mode: String): Boolean = {
       val status = probeWithBasic(uri, host, user, password)

@@ -24,11 +24,11 @@ trusted as before — no extra round-trips on the happy path.
 The probe behavior is controlled by `dev.chungmin.azure.validateExistingCredentials`
 (values: `auto` (default), `always`, `never`).
 
-| Mode | On 401 + Entra reachable | On 401 + Entra unreachable | Use case |
-|---|---|---|---|
-| `auto` (default) | Drop entry, use Entra | Keep entry, log INFO | Recover from stale PATs automatically; same outcome as today when Entra is also unavailable |
-| `always` | Drop entry, use Entra | Drop entry, Entra error surfaces | Force Entra path; surfaces Entra-side failures with actionable errors |
-| `never` | Trust entry | Trust entry | Pre-0.0.10 behavior — disables the probe entirely |
+| Mode | 401 + Entra reachable + new token works for feed | 401 + Entra reachable but new token has no feed access | 401 + Entra unreachable | Use case |
+|---|---|---|---|---|
+| `auto` (default) | Drop entry, use Entra | Keep entry, log INFO about Entra identity scope | Keep entry, log INFO with `az login` remediation | Recover from stale PATs automatically; falls back to trusting settings.xml when Entra also can't help (e.g. Managed Identity without feed access) |
+| `always` | Drop entry, use Entra | Drop entry (no Bearer-verify in `always` mode); fetch then 401s and sbt/coursier surfaces the error | Drop entry, Entra error surfaces (`WARN` from `getTokenImpl`) | Force Entra path; surfaces Entra-side failures with actionable errors |
+| `never` | Trust entry | Trust entry | Trust entry | Pre-0.0.10 behavior — disables the probe entirely |
 
 Set via any of:
 

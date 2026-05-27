@@ -1038,18 +1038,7 @@ class CredentialsBuilderSpec extends AnyFlatSpec with Matchers with BeforeAndAft
 
   // ─── probe cache (per-builder, URI-keyed) ──────────────────────────────
 
-  "isStaleSettingsEntry cache" should "probe at most once per URI per builder" in {
-    withValidationMode(Some("always")) {
-      val b = new ProbeBuilder(Some(401))
-      val uri = new URI("https://pkgs.dev.azure.com/o/p/_packaging/f/maven/v1")
-      b.isStaleSettingsEntry(uri, "pkgs.dev.azure.com", "u", "p") shouldBe true
-      b.isStaleSettingsEntry(uri, "pkgs.dev.azure.com", "u", "p") shouldBe true
-      b.isStaleSettingsEntry(uri, "pkgs.dev.azure.com", "u", "p") shouldBe true
-      b.probeCalls shouldBe 3 // ProbeBuilder doesn't honor cache, but the REAL impl does — verified by the real-impl test below
-    }
-  }
-
-  it should "actually cache in the real implementation (one probeAndDecide call per URI)" in {
+  "isStaleSettingsEntry cache" should "actually cache in the real implementation (one probeAndDecide call per URI)" in {
     withValidationMode(Some("always")) {
       var calls = 0
       val builder = new AzureDevOpsCredentialsPlugin.CredentialsBuilder(nullLog) {
