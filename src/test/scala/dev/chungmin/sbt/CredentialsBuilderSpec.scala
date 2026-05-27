@@ -881,6 +881,26 @@ class CredentialsBuilderSpec extends AnyFlatSpec with Matchers with BeforeAndAft
     }
   }
 
+  // ─── probeWithBasic / probeWithBearer NonFatal swallow ─────────────────
+  //
+  // The decision-tree tests below override these seams wholesale, so the real
+  // try/catch wrappers around headRequest never fire in those paths. Cover
+  // them directly with an unreachable https URI so the connect throws a
+  // NonFatal IOException → catch returns None → caller treats as "trust the
+  // entry". Mirrors the headRequest-https-unbound-port test above.
+
+  "probeWithBasic" should "swallow NonFatal exceptions from headRequest and return None" in {
+    val builder = new AzureDevOpsCredentialsPlugin.CredentialsBuilder(nullLog)
+    val uri = new URI("https://localhost:1/")
+    builder.probeWithBasic(uri, "localhost", "u", "p") shouldBe None
+  }
+
+  "probeWithBearer" should "swallow NonFatal exceptions from headRequest and return None" in {
+    val builder = new AzureDevOpsCredentialsPlugin.CredentialsBuilder(nullLog)
+    val uri = new URI("https://localhost:1/")
+    builder.probeWithBearer(uri, "localhost", "entra-token") shouldBe None
+  }
+
   // ─── isStaleSettingsEntry (the probe decision matrix) ──────────────────
 
   /** A CredentialsBuilder that lets each test pin individual seams.
