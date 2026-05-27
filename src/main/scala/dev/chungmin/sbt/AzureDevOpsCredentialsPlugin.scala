@@ -764,20 +764,30 @@ object AzureDevOpsCredentialsPlugin extends AutoPlugin {
       * entry is stale. Returns `true` if the entry should be dropped (stale),
       * `false` if it should be kept (trusted).
       *
-      * Public-but-`protected[chungmin]` is intentional: the suffix `Impl` and
-      * the visibility are the test-injection seam. Tests in
-      * `dev.chungmin.sbt` override this method to inject specific
-      * `(probeWithBasic, probeWithBearer)` outcomes and assert the
-      * decision-tree branches in isolation — for example, `probeAndDecide
-      * (auto, Entra works, Bearer probe ALSO 401)` overrides this with a
-      * canned `false` to bypass the real probe while exercising the
-      * surrounding `isStaleSettingsEntry` flow.
+      * Public-but-`protected[chungmin]` is intentional — it makes this method
+      * one of two test-injection seams used by the spec, depending on what the
+      * test wants to assert:
+      *
+      *  - Tests that want to assert the surrounding wiring (cache hits, mode
+      *    short-circuits, `isStaleSettingsEntry` host/scheme gates) override
+      *    `probeAndDecideImpl` itself with a canned outcome. The
+      *    "actually cache in the real implementation" test in
+      *    `CredentialsBuilderSpec.scala` is an example: it overrides this
+      *    method to return `true` and counts call sites, so the surrounding
+      *    `computeIfAbsent` is what's actually under test.
+      *  - Tests that want to assert THIS method's decision tree
+      *    (Basic-probe 401 → auto/always fork → Bearer-verify 401 → keep, etc.)
+      *    leave `probeAndDecideImpl` intact and instead override
+      *    [[probeWithBasic]] / [[probeWithBearer]] (their own Scaladoc explains
+      *    that seam separately). The `isStaleSettingsEntry decision tree`
+      *    tests in `CredentialsBuilderSpec.scala` use this pattern via
+      *    `stubProbeBuilder`.
       *
       * `mode` is passed explicitly as an argument (not read from the
-      * enclosing builder's `mode` field) so a test override can assert
-      * decision-tree behaviour against an arbitrary mode value without
-      * constructing a separate builder per mode. Production's only call
-      * site (in [[isStaleSettingsEntry]]) passes the builder's `mode`
+      * enclosing builder's `mode` field) so a test override of EITHER seam
+      * can assert decision-tree behaviour against an arbitrary mode value
+      * without constructing a separate builder per mode. Production's only
+      * call site (in [[isStaleSettingsEntry]]) passes the builder's `mode`
       * field verbatim — do not collapse the parameter into a `this.mode`
       * read without removing the test-injection seam, or the per-call mode
       * argument silently stops mattering. */

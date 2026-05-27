@@ -885,10 +885,10 @@ class CredentialsBuilderSpec extends AnyFlatSpec with Matchers with BeforeAndAft
 
   /** A CredentialsBuilder that lets each test pin individual seams.
     *
-    * - `probeStatus` controls what headRequest "returns" (we inject by
-    *   overriding probeAndDecide-adjacent state via getToken + a fake
-    *   headRequest stub installed at construction).
-    * - `tokenAvailable` controls whether getToken() returns Some/None,
+    * - `probeStatus` controls what `headRequest` "returns" — we override
+    *   `isStaleSettingsEntry` wholesale and let `probeStatus` drive the
+    *   simulated probe outcome, so no real network call happens.
+    * - `tokenAvailable` controls whether `getToken()` returns Some/None,
     *   exercising the auto-mode fork. */
   private class ProbeBuilder(
       probeStatus: Option[Int],
@@ -896,8 +896,8 @@ class CredentialsBuilderSpec extends AnyFlatSpec with Matchers with BeforeAndAft
   ) extends AzureDevOpsCredentialsPlugin.CredentialsBuilder(nullLog) {
     override protected def getToken(): Option[String] =
       if (tokenAvailable) Some("entra-token") else None
-    // Stub the network call: override probeAndDecide via the helper that
-    // its only call site (isStaleSettingsEntry) consults.
+    // Stub the network call: override isStaleSettingsEntry wholesale so the
+    // simulated probeStatus drives the decision, no actual headRequest fires.
     var probeCalls = 0
     override private[chungmin] def isStaleSettingsEntry(
         uri: URI, host: String, user: String, password: String): Boolean = {
@@ -991,10 +991,10 @@ class CredentialsBuilderSpec extends AnyFlatSpec with Matchers with BeforeAndAft
     }
   }
 
-  // ─── probeAndDecide via the real implementation (end-to-end) ───────────
+  // ─── probeAndDecideImpl via the real implementation (end-to-end) ───────
 
   // The ProbeBuilder above stubs out the network probe to make the decision
-  // tree directly assertable. This test exercises the REAL probeAndDecide
+  // tree directly assertable. This test exercises the REAL probeAndDecideImpl
   // through buildCredentialsFromMavenSettings + a local socket server, so
   // a future refactor of the real implementation that breaks the decision
   // tree shows up here (rather than only in integration tests).
@@ -1038,7 +1038,7 @@ class CredentialsBuilderSpec extends AnyFlatSpec with Matchers with BeforeAndAft
 
   // ─── probe cache (per-builder, URI-keyed) ──────────────────────────────
 
-  "isStaleSettingsEntry cache" should "actually cache in the real implementation (one probeAndDecide call per URI)" in {
+  "isStaleSettingsEntry cache" should "actually cache in the real implementation (one probeAndDecideImpl call per URI)" in {
     withValidationMode(Some("always")) {
       var calls = 0
       val builder = new AzureDevOpsCredentialsPlugin.CredentialsBuilder(nullLog) {
@@ -1139,14 +1139,14 @@ class CredentialsBuilderSpec extends AnyFlatSpec with Matchers with BeforeAndAft
     }
   }
 
-  // ─── probeAndDecide decision-tree tests ────────────────────────────────
+  // ─── probeAndDecideImpl decision-tree tests ────────────────────────────
 
   // These exercise probeAndDecideImpl's branching logic directly, using
   // stubbed probeWithBasic / probeWithBearer values. The headRequest
   // wire-format and TLS-endpoint-ID invariants are verified by their
   // dedicated tests above.
 
-  "probeAndDecide" should "return false (trust) when network probe returns 200" in {
+  "probeAndDecideImpl" should "return false (trust) when network probe returns 200" in {
     val builder = stubProbeBuilder(
       basicStatus = Some(200), bearerStatus = None, tokenValue = "n/a")
     val uri = new URI("https://pkgs.dev.azure.com/o/p/_packaging/f/maven/v1")
@@ -1225,7 +1225,7 @@ class CredentialsBuilderSpec extends AnyFlatSpec with Matchers with BeforeAndAft
           uri: URI, host: String, token: String): Option[Int] = bearerStatus
     }
 
-  "probeAndDecide (auto, Entra works, Bearer probe succeeds)" should
+  "isStaleSettingsEntry decision tree (auto, Entra works, Bearer probe succeeds)" should
       "return true (drop entry) when the verification probe doesn't get 401" in {
     val builder = stubProbeBuilder(
       basicStatus = Some(401),
@@ -1237,7 +1237,7 @@ class CredentialsBuilderSpec extends AnyFlatSpec with Matchers with BeforeAndAft
       AzureDevOpsCredentialsPlugin.ValidateAuto) shouldBe true
   }
 
-  "probeAndDecide (auto, Entra works, Bearer probe ALSO 401)" should
+  "isStaleSettingsEntry decision tree (auto, Entra works, Bearer probe ALSO 401)" should
       "return false (keep entry) — the Entra identity has no feed access" in {
     // The bug-1 scenario: stale PAT → 401 on Basic probe; getToken() succeeds
     // via (say) Managed Identity on an Azure VM; but the MI has no access to
@@ -1256,7 +1256,7 @@ class CredentialsBuilderSpec extends AnyFlatSpec with Matchers with BeforeAndAft
       AzureDevOpsCredentialsPlugin.ValidateAuto) shouldBe false
   }
 
-  "probeAndDecide (auto, Bearer verify network error)" should
+  "isStaleSettingsEntry decision tree (auto, Bearer verify network error)" should
       "assume token works (return true, drop entry) — be optimistic on transient blip" in {
     // Basic probe answered with 401 (stale); Bearer-verify fails with a
     // network error (probeWithBearer catches the IOException and returns
