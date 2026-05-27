@@ -679,10 +679,19 @@ object AzureDevOpsCredentialsPlugin extends AutoPlugin {
     // for feed B if feed A's PAT happened to be valid (the bug this PR is
     // designed to fix), or silently dropping valid entries for feed A if
     // feed B's PAT happened to be stale. Per-URI keeps the optimization
-    // ("one probe per distinct feed in a multi-module build") while making
-    // the verdict per-credential. ConcurrentHashMap + `computeIfAbsent`
-    // ensures we don't double-probe under concurrent first-touch from
-    // parallel `credentials` task evaluation.
+    // (one probe per distinct feed URI within a single credentials-task
+    // evaluation — i.e. deduping when multiple resolvers in one project
+    // resolve to the same URI, and deduping concurrent first-touch when
+    // sbt evaluates the credentials task in parallel within that project)
+    // while making the verdict per-credential. ConcurrentHashMap +
+    // `computeIfAbsent` provides the concurrent-first-touch atomicity.
+    //
+    // The cache scope is per-builder, and `projectSettings` instantiates
+    // one builder per project's `credentials` task. An N-module sbt build
+    // that shares one feed across all modules will probe N times across
+    // the build (once per module) — sharing the cache across modules
+    // would require build-scope mutable state we deliberately don't
+    // introduce.
     private val probeCache =
       new java.util.concurrent.ConcurrentHashMap[String, java.lang.Boolean]()
 
@@ -730,7 +739,16 @@ object AzureDevOpsCredentialsPlugin extends AutoPlugin {
 
     /** Test seam for [[probeAndDecide]]. Production binds to a thin proxy of
       * the real implementation; tests override this to inject specific probe
-      * outcomes and assert call counts (e.g. cache-hit verification). */
+      * outcomes and assert call counts (e.g. cache-hit verification).
+      *
+      * `mode` is passed explicitly as an argument (not read from the enclosing
+      * builder's `mode` field) so a test can override `probeAndDecideImpl`
+      * and assert decision-tree behaviour against an arbitrary mode without
+      * constructing a new builder per mode. Production's only call site
+      * (in [[isStaleSettingsEntry]]) passes the builder's `mode` field
+      * verbatim — do not collapse the parameter into a `this.mode` read
+      * without removing the test-injection seam, or the indirection silently
+      * stops mattering. */
     protected[chungmin] def probeAndDecideImpl(
         uri: URI, host: String, user: String, password: String, mode: String): Boolean = {
       val status = probeWithBasic(uri, host, user, password)

@@ -1002,9 +1002,9 @@ class CredentialsBuilderSpec extends AnyFlatSpec with Matchers with BeforeAndAft
     users shouldBe Seq("preserved")
   }
 
-  // ─── probe cache (per-builder, host-keyed) ─────────────────────────────
+  // ─── probe cache (per-builder, URI-keyed) ──────────────────────────────
 
-  "isStaleSettingsEntry cache" should "probe at most once per host per builder" in {
+  "isStaleSettingsEntry cache" should "probe at most once per URI per builder" in {
     withValidationMode(Some("always")) {
       val b = new ProbeBuilder(Some(401))
       val uri = new URI("https://pkgs.dev.azure.com/o/p/_packaging/f/maven/v1")
@@ -1015,7 +1015,7 @@ class CredentialsBuilderSpec extends AnyFlatSpec with Matchers with BeforeAndAft
     }
   }
 
-  it should "actually cache in the real implementation (one probeAndDecide call per host)" in {
+  it should "actually cache in the real implementation (one probeAndDecide call per URI)" in {
     withValidationMode(Some("always")) {
       var calls = 0
       val builder = new AzureDevOpsCredentialsPlugin.CredentialsBuilder(nullLog) {
