@@ -903,8 +903,10 @@ class CredentialsBuilderSpec extends AnyFlatSpec with Matchers with BeforeAndAft
       // Re-implement the decision tree inline rather than calling super, so
       // `probeStatus` drives the simulated probe outcome without any real
       // headRequest / network round-trip. Mirrors enough of the production
-      // short-circuit logic (Never/host gates) for the mode/host-gate tests
-      // below to assert the right gating behavior via the return value alone.
+      // short-circuit logic (Never/host gates) for the tests below to
+      // exercise both the gate-level short-circuits (never mode, non-ADO
+      // host, null host) and the inner decision tree (Basic-probe 200/401,
+      // auto+token availability, network error) via the return value alone.
       val mode = AzureDevOpsCredentialsPlugin.validateExistingCredentialsMode()
       if (mode == AzureDevOpsCredentialsPlugin.ValidateNever) return false
       if (host == null || !AzureDevOpsCredentialsPlugin.isAzureDevOpsHost(host)) return false
@@ -1164,6 +1166,7 @@ class CredentialsBuilderSpec extends AnyFlatSpec with Matchers with BeforeAndAft
       uri, "pkgs.dev.azure.com", "u", "p",
       AzureDevOpsCredentialsPlugin.ValidateAlways) shouldBe true
   }
+
   it should "return false (keep) when probe is 401 + auto + Entra unreachable" in {
     val builder = new AzureDevOpsCredentialsPlugin.CredentialsBuilder(nullLog) {
       override protected def newCredential(): TokenCredential =
@@ -1191,16 +1194,21 @@ class CredentialsBuilderSpec extends AnyFlatSpec with Matchers with BeforeAndAft
 
   /** Test helper: build a CredentialsBuilder whose probeWithBasic /
     * probeWithBearer return canned `Option[Int]` values, and whose
-    * newCredential returns a fixed token string. Lets the bug-1 / bug-2
-    * tests assert probeAndDecideImpl's decision tree directly against
-    * specific (Basic-probe, Bearer-probe) outcome combinations, without
-    * driving any actual network round-trip — `headRequest` now refuses
-    * to send Authorization headers over http:// URIs, so the previous
-    * `withSequentialServers + http://localhost:$port/` pattern can no
-    * longer hit the probe path. Stubbing the probe helpers (the boundary
-    * just above `headRequest`) keeps these tests focused on the decision
-    * logic. The `headRequest` wire-format and TLS-endpoint-ID
-    * invariants have their own dedicated tests above. */
+    * newCredential returns a fixed token string. Lets the
+    * `probeAndDecideImpl` decision-tree tests — both the simple-decision
+    * cases (Basic-probe only: 200, 401-always, network error) and the
+    * bug-1 auto-mode Bearer-verify cases (Basic 401 → re-probe with Entra
+    * token: Bearer 200 / Bearer 401 / Bearer network error) — assert the
+    * decision logic directly against specific (Basic-probe, Bearer-probe)
+    * outcome combinations, without driving any actual network round-trip.
+    * `headRequest` now refuses to send Authorization headers over http://
+    * URIs, so the previous `withSequentialServers + http://localhost:$port/`
+    * pattern can no longer hit the probe path; stubbing the probe helpers
+    * (the boundary just above `headRequest`) keeps these tests focused on
+    * the decision logic. The `headRequest` wire-format and TLS-endpoint-ID
+    * invariants have their own dedicated tests above. Not used by the
+    * bug-2 (CredentialsBuilder(log, mode) constructor) tests — those
+    * exercise the mode-injection path, not the probe decision tree. */
   private def stubProbeBuilder(
       basicStatus: Option[Int],
       bearerStatus: Option[Int],
