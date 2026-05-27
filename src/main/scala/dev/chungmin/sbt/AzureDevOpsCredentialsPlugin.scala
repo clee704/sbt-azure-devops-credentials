@@ -779,9 +779,10 @@ object AzureDevOpsCredentialsPlugin extends AutoPlugin {
       *    (Basic-probe 401 → auto/always fork → Bearer-verify 401 → keep, etc.)
       *    leave `probeAndDecideImpl` intact and instead override
       *    [[probeWithBasic]] / [[probeWithBearer]] (their own Scaladoc explains
-      *    that seam separately). The `isStaleSettingsEntry decision tree`
-      *    tests in `CredentialsBuilderSpec.scala` use this pattern via
-      *    `stubProbeBuilder`.
+      *    that seam separately). The `probeAndDecideImpl` decision-tree tests
+      *    in `CredentialsBuilderSpec.scala` use this pattern via
+      *    `stubProbeBuilder` — both the simple-decision tests (Basic-probe
+      *    only) and the auto-mode Bearer-verify tests live under that label.
       *
       * `mode` is passed explicitly as an argument (not read from the
       * enclosing builder's `mode` field) so a test override of EITHER seam

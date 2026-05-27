@@ -901,8 +901,11 @@ class CredentialsBuilderSpec extends AnyFlatSpec with Matchers with BeforeAndAft
     var probeCalls = 0
     override private[chungmin] def isStaleSettingsEntry(
         uri: URI, host: String, user: String, password: String): Boolean = {
-      // Call the real implementation, but intercept the network probe by
-      // routing through a test-only headRequest stub that returns probeStatus.
+      // Re-implement the decision tree inline rather than calling super, so
+      // `probeStatus` drives the simulated probe outcome without any real
+      // headRequest / network round-trip — and so `probeCalls` records every
+      // surviving (non-short-circuited) invocation, which the mode/host-gate
+      // tests below assert on directly.
       val mode = AzureDevOpsCredentialsPlugin.validateExistingCredentialsMode()
       if (mode == AzureDevOpsCredentialsPlugin.ValidateNever) return false
       if (host == null || !AzureDevOpsCredentialsPlugin.isAzureDevOpsHost(host)) return false
@@ -991,13 +994,13 @@ class CredentialsBuilderSpec extends AnyFlatSpec with Matchers with BeforeAndAft
     }
   }
 
-  // ─── probeAndDecideImpl via the real implementation (end-to-end) ───────
+  // ─── buildCredentialsFromMavenSettings probe wiring ────────────────────
 
-  // The ProbeBuilder above stubs out the network probe to make the decision
-  // tree directly assertable. This test exercises the REAL probeAndDecideImpl
-  // through buildCredentialsFromMavenSettings + a local socket server, so
-  // a future refactor of the real implementation that breaks the decision
-  // tree shows up here (rather than only in integration tests).
+  // These tests exercise the wiring that consults isStaleSettingsEntry from
+  // inside buildCredentialsFromMavenSettings — verifying that a stale verdict
+  // drops the entry and a fresh verdict keeps it. The `stale` callback here
+  // (passed into testBuilder) stubs isStaleSettingsEntry wholesale; the real
+  // probeAndDecideImpl decision tree has its own dedicated tests below.
   "buildCredentialsFromMavenSettings probe" should
       "drop the settings entry when the local probe server returns 401 in 'always' mode" in {
     withValidationMode(Some("always")) {
@@ -1225,7 +1228,7 @@ class CredentialsBuilderSpec extends AnyFlatSpec with Matchers with BeforeAndAft
           uri: URI, host: String, token: String): Option[Int] = bearerStatus
     }
 
-  "isStaleSettingsEntry decision tree (auto, Entra works, Bearer probe succeeds)" should
+  "probeAndDecideImpl (auto, Entra works, Bearer probe succeeds)" should
       "return true (drop entry) when the verification probe doesn't get 401" in {
     val builder = stubProbeBuilder(
       basicStatus = Some(401),
@@ -1237,7 +1240,7 @@ class CredentialsBuilderSpec extends AnyFlatSpec with Matchers with BeforeAndAft
       AzureDevOpsCredentialsPlugin.ValidateAuto) shouldBe true
   }
 
-  "isStaleSettingsEntry decision tree (auto, Entra works, Bearer probe ALSO 401)" should
+  "probeAndDecideImpl (auto, Entra works, Bearer probe ALSO 401)" should
       "return false (keep entry) — the Entra identity has no feed access" in {
     // The bug-1 scenario: stale PAT → 401 on Basic probe; getToken() succeeds
     // via (say) Managed Identity on an Azure VM; but the MI has no access to
@@ -1256,7 +1259,7 @@ class CredentialsBuilderSpec extends AnyFlatSpec with Matchers with BeforeAndAft
       AzureDevOpsCredentialsPlugin.ValidateAuto) shouldBe false
   }
 
-  "isStaleSettingsEntry decision tree (auto, Bearer verify network error)" should
+  "probeAndDecideImpl (auto, Bearer verify network error)" should
       "assume token works (return true, drop entry) — be optimistic on transient blip" in {
     // Basic probe answered with 401 (stale); Bearer-verify fails with a
     // network error (probeWithBearer catches the IOException and returns
