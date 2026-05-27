@@ -1117,15 +1117,15 @@ class CredentialsBuilderSpec extends AnyFlatSpec with Matchers with BeforeAndAft
   }
 
   it should "short-circuit to false for http:// URIs without probing (no cleartext credentials)" in {
-    // R6 fix: even when the host passes isAzureDevOpsHost (user typed the right
+    // Even when the host passes isAzureDevOpsHost (user typed the right
     // ADO hostname), an http:// scheme would cause headRequest to use a plain
     // TCP socket and put the Authorization header on the wire in cleartext.
-    // Same vulnerability class as R5's TLS endpoint-ID gap (cleartext
-    // credentials) but a distinct codepath the R5 fix didn't cover — that fix
-    // only enables hostname verification GIVEN TLS, not the case of no TLS at
-    // all. Trust-the-entry (return false) is the right default for the
-    // misconfigured-resolver case: preserves legacy v0.0.9 behavior and
-    // guarantees no credentials reach a cleartext wire from the probe path.
+    // Same vulnerability class as a missing TLS endpoint-ID check
+    // (credentials leaking via insecure transport) but a distinct codepath:
+    // TLS endpoint-ID verification only protects you GIVEN TLS, not the case
+    // of no TLS at all. Trust-the-entry (return false) is the right default
+    // for the misconfigured-resolver case: preserves legacy v0.0.9 behavior
+    // and guarantees no credentials reach a cleartext wire from the probe path.
     withValidationMode(Some("always")) {
       var calls = 0
       val builder = new AzureDevOpsCredentialsPlugin.CredentialsBuilder(nullLog) {
@@ -1190,14 +1190,14 @@ class CredentialsBuilderSpec extends AnyFlatSpec with Matchers with BeforeAndAft
       AzureDevOpsCredentialsPlugin.ValidateAlways) shouldBe false
   }
 
-  // ─── auto-mode Bearer verification (bug-1 fix: re-probe with Entra token) ───
+  // ─── auto-mode Bearer verification: re-probe with the new Entra token ─────
 
   /** Test helper: build a CredentialsBuilder whose probeWithBasic /
     * probeWithBearer return canned `Option[Int]` values, and whose
     * newCredential returns a fixed token string. Lets the
     * `probeAndDecideImpl` decision-tree tests — both the simple-decision
     * cases (Basic-probe only: 200, 401-always, network error) and the
-    * bug-1 auto-mode Bearer-verify cases (Basic 401 → re-probe with Entra
+    * auto-mode Bearer-verify cases (Basic 401 → re-probe with Entra
     * token: Bearer 200 / Bearer 401 / Bearer network error) — assert the
     * decision logic directly against specific (Basic-probe, Bearer-probe)
     * outcome combinations, without driving any actual network round-trip.
@@ -1207,8 +1207,8 @@ class CredentialsBuilderSpec extends AnyFlatSpec with Matchers with BeforeAndAft
     * (the boundary just above `headRequest`) keeps these tests focused on
     * the decision logic. The `headRequest` wire-format and TLS-endpoint-ID
     * invariants have their own dedicated tests above. Not used by the
-    * bug-2 (CredentialsBuilder(log, mode) constructor) tests — those
-    * exercise the mode-injection path, not the probe decision tree. */
+    * `CredentialsBuilder(log, mode)` constructor tests — those exercise
+    * the mode-injection path, not the probe decision tree. */
   private def stubProbeBuilder(
       basicStatus: Option[Int],
       bearerStatus: Option[Int],
@@ -1236,7 +1236,7 @@ class CredentialsBuilderSpec extends AnyFlatSpec with Matchers with BeforeAndAft
 
   "probeAndDecideImpl (auto, Entra works, Bearer probe ALSO 401)" should
       "return false (keep entry) — the Entra identity has no feed access" in {
-    // The bug-1 scenario: stale PAT → 401 on Basic probe; getToken() succeeds
+    // The Entra-identity-lacks-feed-access scenario: stale PAT → 401 on Basic probe; getToken() succeeds
     // via (say) Managed Identity on an Azure VM; but the MI has no access to
     // the user's feed, so Bearer-probe with the new token ALSO returns 401.
     // Overriding the user's PAT with that token would leave the build still
@@ -1271,7 +1271,7 @@ class CredentialsBuilderSpec extends AnyFlatSpec with Matchers with BeforeAndAft
       AzureDevOpsCredentialsPlugin.ValidateAuto) shouldBe true
   }
 
-  // ─── CredentialsBuilder(log, mode) constructor (bug-2 fix) ─────────────
+  // ─── CredentialsBuilder(log, mode) constructor: per-project mode injection ──
 
   "CredentialsBuilder(log, mode)" should
       "use the passed-in mode regardless of -D system property (per-project scoping)" in {
@@ -1315,7 +1315,7 @@ class CredentialsBuilderSpec extends AnyFlatSpec with Matchers with BeforeAndAft
   }
 
   it should "normalize mode case-insensitively when passed in directly (regression guard)" in {
-    // Bug: prior to the R1 fix, `CredentialsBuilder(log, "NEVER")` would compare
+    // Without case-insensitive normalization, `CredentialsBuilder(log, "NEVER")` would compare
     // raw "NEVER" against the lowercase ValidateNever constant, fail equality,
     // and silently fall into the auto branch — defeating users who set
     // `-Ddev.chungmin.azure.validateExistingCredentials=NEVER` (a common shell
@@ -1351,11 +1351,11 @@ class CredentialsBuilderSpec extends AnyFlatSpec with Matchers with BeforeAndAft
       "pkgs.dev.azure.com", "u", "p") shouldBe false
   }
 
-  // ─── probe cache key (R1 finding: host-keyed cache collides across feeds) ──
+  // ─── probe cache key: per-feed-URI (host-keyed would collide across feeds) ──
 
   "isStaleSettingsEntry cache" should
       "probe distinct feeds on the same host INDEPENDENTLY (not host-keyed)" in {
-    // R1 bug: keying the cache by host alone meant two ADO feeds on the same
+    // Bug class: keying the cache by host alone would let two ADO feeds on the same
     // host (e.g. `<org>.pkgs.visualstudio.com/A365/_packaging/FeedA/...` vs
     // `<org>.pkgs.visualstudio.com/A365/_packaging/FeedB/...`, or two orgs on
     // `pkgs.dev.azure.com`) would inherit each other's verdicts — silently
