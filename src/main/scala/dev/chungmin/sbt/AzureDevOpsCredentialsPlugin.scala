@@ -726,13 +726,22 @@ object AzureDevOpsCredentialsPlugin extends AutoPlugin {
       * should be dropped (returns `true` = "drop, fall through to Entra")
       * or trusted (`false`).
       *
-      * Honors [[ValidateExistingCredentialsProperty]]:
-      *   - `never` → always trust (returns `false` without probing)
-      *   - `always` → probe; drop on 401, trust otherwise
-      *   - `auto` (default) → probe; on 401 try Entra. If Entra works,
-      *     drop. If Entra unreachable, keep the entry but log an INFO line
-      *     telling the user what happened so the eventual 401 isn't a
-      *     mystery.
+      * Honors the builder's `mode` (resolved at construction from
+      * [[ValidateExistingCredentialsProperty]] OR the build.sbt setting
+      * key [[autoImport.azureDevOpsValidateExistingCredentials]] — the
+      * setting key wins for per-project scoping):
+      *   - `never` → always trust (returns `false` without probing).
+      *   - `always` → probe; drop on 401, trust otherwise.
+      *   - `auto` (default) → probe; on 401 try Entra. If Entra is
+      *     unreachable, keep the entry and log an INFO line with `az
+      *     login` remediation. If Entra IS reachable, re-probe the feed
+      *     with the new token to verify it has feed access:
+      *     Bearer-probe non-401 → drop the entry (Entra path takes over);
+      *     Bearer-probe 401 → keep the entry and log an INFO line about
+      *     Entra-identity feed scope (common on Azure VMs whose Managed
+      *     Identity doesn't cover the user's feed). On a Bearer-probe
+      *     network error, take the optimistic-drop branch (treat as "not
+      *     401") rather than re-stranding the user with their stale PAT.
       *
       * Probe results are cached per URI for the builder's lifetime (see
       * [[probeCache]] doc for why URI and not host).
