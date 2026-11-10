@@ -17,6 +17,7 @@ package dev.chungmin.sbt
 
 import java.io.{BufferedReader, BufferedWriter, InputStreamReader, OutputStreamWriter}
 import java.net.{InetSocketAddress, Socket}
+import java.util.concurrent.{Callable, ExecutionException, FutureTask}
 
 import javax.net.ssl.{SSLSocket, SSLSocketFactory}
 
@@ -155,10 +156,9 @@ object AzureDevOpsCredentialsPlugin extends AutoPlugin {
 
   // Reference-counted suppression of the Azure-identity log-level system
   // property. The first acquirer saves the previous value and sets the
-  // property to "off"; the last releaser restores it. Counted-set pattern
-  // so that multiple in-flight CredentialsBuilder instances share one
-  // suppression window without holding any lock during the (slow) Azure
-  // SDK call — only the brief save+set / restore boundaries serialize.
+  // property to "off"; the last releaser restores it. The shared token fetch
+  // acquires once across both attempts; the counter also supports nested
+  // suppression without holding a lock during the Azure SDK call.
   //
   // Synchronized on this private monitor, not on the plugin object itself,
   // so the lock can't be observed (or coincidentally taken) by outside
@@ -216,6 +216,40 @@ object AzureDevOpsCredentialsPlugin extends AutoPlugin {
     * and pin any future leak to its actual source. */
   private[chungmin] def suppressionCountForTesting: Int =
     AzureIdentityLogSuppressionLock.synchronized { suppressionCount }
+
+  // Concurrent builders share one acquisition for the fixed AzureDevOpsScope
+  // and the JVM's credential chain. Future per-project credential, tenant, or
+  // scope settings must key or bypass this flight.
+  private val TokenFetchLock = new Object
+  private var inFlightTokenFetch: Option[FutureTask[Option[String]]] = None
+
+  private[chungmin] def tokenFetchInProgressForTesting: Boolean =
+    TokenFetchLock.synchronized { inFlightTokenFetch.isDefined }
+
+  private def sharedTokenFetch(log: Logger)(fetch: => Option[String]): Option[String] = {
+    val task = TokenFetchLock.synchronized {
+      inFlightTokenFetch match {
+        case Some(current) =>
+          log.debug("waiting for in-progress access token acquisition")
+          current
+        case None =>
+          val current = new FutureTask[Option[String]](new Callable[Option[String]] {
+            override def call(): Option[String] =
+              try fetch
+              finally TokenFetchLock.synchronized {
+                inFlightTokenFetch = None
+              }
+          })
+          inFlightTokenFetch = Some(current)
+          current
+      }
+    }
+    task.run()
+    try task.get()
+    catch {
+      case e: ExecutionException => throw e.getCause
+    }
+  }
 
   /** Normalize an env-var value: trim surrounding whitespace and return
     * `Some(trimmed)` when the result is non-empty; `None` for absent, empty,
@@ -554,7 +588,10 @@ object AzureDevOpsCredentialsPlugin extends AutoPlugin {
     protected def mavenSettingsFile: File = new File(sbt.io.Path.userHome, ".m2/settings.xml")
 
     /** Create the TokenCredential chain used by [[getTokenImpl]]. Overridable
-      * for testing so the Azure SDK does not have to be exercised. */
+      * for testing so the Azure SDK does not have to be exercised.
+      * Concurrent builders share one acquisition for the fixed scope and the
+      * JVM's credential chain. Future per-project credential, tenant, or scope
+      * settings must key or bypass the shared fetch. */
     protected def newCredential(): TokenCredential = AzureDevOpsCredentialsPlugin.createCredential()
 
     private def buildCredentialsWithAccessToken(
@@ -619,24 +656,29 @@ object AzureDevOpsCredentialsPlugin extends AutoPlugin {
     /** Acquire and cache an Azure DevOps access token. Overridable for testing. */
     protected def getToken(): Option[String] = synchronized {
       if (!cachedToken.isDefined) {
-        cachedToken = Some(getTokenImpl())
+        cachedToken = Some(AzureDevOpsCredentialsPlugin.sharedTokenFetch(log) {
+          getTokenWithRetry()
+        })
       }
       cachedToken.get
     }
 
-    private def getTokenImpl(): Option[String] = {
-      log.debug("trying to create access token")
-      // Suppress Azure Identity logging during token acquisition. ChainedTokenCredential
-      // logs [ERROR] for each provider that fails, which are expected failures — not all
-      // providers are available in all environments.
-      //
-      // The suppression is a JVM-wide system property (`AzureIdentityLogProperty`), so
-      // we coordinate via a counted-set on the plugin object: the first acquirer saves
-      // the previous value and sets the property to "off"; the last releaser restores
-      // it. The brief save+set / restore boundaries serialize across threads, but the
-      // SDK call itself runs without any plugin-level lock, so multi-project sbt builds
-      // can fetch tokens in parallel.
+    private def getTokenWithRetry(): Option[String] = {
+      // Only the shared fetch suppresses expected credential-provider failures.
+      // Keep suppression active through the retry and restore it before completion.
       AzureDevOpsCredentialsPlugin.acquireAzureIdentityLogSuppression()
+      try {
+        getTokenImpl(reportFailure = false).orElse {
+          log.debug("retrying access token acquisition")
+          getTokenImpl(reportFailure = true)
+        }
+      } finally {
+        AzureDevOpsCredentialsPlugin.releaseAzureIdentityLogSuppression()
+      }
+    }
+
+    private def getTokenImpl(reportFailure: Boolean): Option[String] = {
+      log.debug("trying to create access token")
       try {
         val credential = newCredential()
         val request = new TokenRequestContext().addScopes(AzureDevOpsScope)
@@ -645,16 +687,20 @@ object AzureDevOpsCredentialsPlugin extends AutoPlugin {
           log.debug("access token created")
           Some(token.getToken())
         } else {
-          log.warn(s"failed to get access token (getToken() returned null)")
+          if (reportFailure) {
+            log.warn("failed to get access token (getToken() returned null)")
+          } else {
+            log.debug("failed to get access token (getToken() returned null)")
+          }
           None
         }
       } catch {
         case NonFatal(e) =>
-          log.warn(s"failed to get access token. Did you forget to run `az login`?")
+          if (reportFailure) {
+            log.warn("failed to get access token. Did you forget to run `az login`?")
+          }
           log.debug(e.toString())
           None
-      } finally {
-        AzureDevOpsCredentialsPlugin.releaseAzureIdentityLogSuppression()
       }
     }
 
@@ -723,11 +769,9 @@ object AzureDevOpsCredentialsPlugin extends AutoPlugin {
     // `computeIfAbsent` provides the concurrent-first-touch atomicity.
     //
     // The cache scope is per-builder, and `projectSettings` instantiates
-    // one builder per project's `credentials` task. An N-module sbt build
-    // that shares one feed across all modules will probe N times across
-    // the build (once per module) — sharing the cache across modules
-    // would require build-scope mutable state we deliberately don't
-    // introduce.
+    // one builder per project's `credentials` task. Feed verdicts depend on
+    // the URI, supplied credentials, and project validation mode, so they
+    // remain local even though in-progress token acquisition is shared.
     private val probeCache =
       new java.util.concurrent.ConcurrentHashMap[String, java.lang.Boolean]()
 
