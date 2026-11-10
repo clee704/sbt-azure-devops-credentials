@@ -18,10 +18,12 @@ package dev.chungmin.sbt
 import java.io.{BufferedWriter, File, OutputStreamWriter, PrintWriter}
 import java.net.{ServerSocket, URI}
 import java.nio.file.Files
-import java.time.{Duration, OffsetDateTime}
-import java.util.concurrent.CountDownLatch
+import java.time.OffsetDateTime
+import java.util.concurrent.{ConcurrentLinkedQueue, CountDownLatch, FutureTask, TimeUnit}
+import java.util.concurrent.atomic.AtomicInteger
 import javax.net.ssl.SSLException
 
+import scala.collection.JavaConverters._
 import scala.util.control.NonFatal
 
 import org.scalatest.BeforeAndAfter
@@ -37,15 +39,21 @@ import reactor.core.publisher.Mono
 
 class CredentialsBuilderSpec extends AnyFlatSpec with Matchers with BeforeAndAfter {
 
-  // Defense in depth for the JVM-global suppression counter. `before` catches
+  // Defense in depth for JVM-global token acquisition and suppression. `before` catches
   // contamination from another spec running in the same JVM; `after` pins any
   // leak in *this* spec to the exact test that caused it (otherwise a leak
   // surfaces as a confusing assertion failure in the next test that reads
   // the Azure-identity log-level property — see the nested-suppression test
   // for the canonical "wrong saved value" symptom that would result). We
   // assert rather than reset so leaks remain visible instead of being masked.
-  before { AzureDevOpsCredentialsPlugin.suppressionCountForTesting shouldBe 0 }
-  after  { AzureDevOpsCredentialsPlugin.suppressionCountForTesting shouldBe 0 }
+  before {
+    AzureDevOpsCredentialsPlugin.suppressionCountForTesting shouldBe 0
+    AzureDevOpsCredentialsPlugin.tokenFetchInProgressForTesting shouldBe false
+  }
+  after {
+    AzureDevOpsCredentialsPlugin.suppressionCountForTesting shouldBe 0
+    AzureDevOpsCredentialsPlugin.tokenFetchInProgressForTesting shouldBe false
+  }
 
   // ─── Test fixtures ─────────────────────────────────────────────────────
 
@@ -59,6 +67,29 @@ class CredentialsBuilderSpec extends AnyFlatSpec with Matchers with BeforeAndAft
     override def log(level: sbt.util.Level.Value, message: => String): Unit = { val _ = message }
   }
 
+  private class RecordingLogger(joined: CountDownLatch = new CountDownLatch(0)) extends Logger {
+    private val entries = new ConcurrentLinkedQueue[(sbt.util.Level.Value, String)]()
+
+    override def trace(t: => Throwable): Unit = { val _ = t }
+    override def success(message: => String): Unit = { val _ = message }
+    override def log(level: sbt.util.Level.Value, message: => String): Unit = {
+      val text = message
+      entries.add(level -> text)
+      if (level == sbt.util.Level.Debug &&
+          text == "waiting for in-progress access token acquisition") {
+        joined.countDown()
+      }
+    }
+
+    def warnings: Seq[String] =
+      entries.iterator().asScala.collect {
+        case (sbt.util.Level.Warn, message) => message
+      }.toList
+  }
+
+  private def await(latch: CountDownLatch, description: String): Unit =
+    assert(latch.await(10, TimeUnit.SECONDS), s"Timed out waiting for $description")
+
   /** Realistic ADO realm — exactly what `pkgs.dev.azure.com` returns in the
     * `WWW-Authenticate: Basic realm="..."` header of its 401 responses. */
   private val AdoRealm = "https://pkgsprodsu3weu.pkgs.visualstudio.com/"
@@ -67,7 +98,7 @@ class CredentialsBuilderSpec extends AnyFlatSpec with Matchers with BeforeAndAft
   private val LegacyAdoFeedUrl = "https://myorg.pkgs.visualstudio.com/myproject/_packaging/myfeed/maven/v1"
 
   /** Build a fake TokenCredential whose `getToken(...)` returns the given Mono. */
-  private def fakeCredential(mono: Mono[AccessToken]): TokenCredential =
+  private def fakeCredential(mono: => Mono[AccessToken]): TokenCredential =
     new TokenCredential {
       override def getToken(request: TokenRequestContext): Mono[AccessToken] = mono
     }
@@ -320,23 +351,64 @@ class CredentialsBuilderSpec extends AnyFlatSpec with Matchers with BeforeAndAft
   // ─── getToken / getTokenImpl (real implementation, fake TokenCredential) ─
 
   /** Test subclass that injects a fake TokenCredential and exposes getToken. */
-  private class TokenProbe(cred: TokenCredential)
-      extends AzureDevOpsCredentialsPlugin.CredentialsBuilder(nullLog) {
+  private class TokenProbe(cred: TokenCredential, log: Logger = nullLog)
+      extends AzureDevOpsCredentialsPlugin.CredentialsBuilder(log) {
     override protected def newCredential(): TokenCredential = cred
     def fetch(): Option[String] = getToken()
   }
+
+  private class TokenFetch(probe: TokenProbe) {
+    private val result = new FutureTask[Option[String]](() => probe.fetch())
+    val thread = new Thread(result)
+    def value: Option[String] = result.get(10, TimeUnit.SECONDS)
+  }
+
+  private def joinFetches(fetches: Seq[TokenFetch]): Unit = {
+    fetches.foreach(_.thread.join(10000))
+    fetches.foreach(fetch => assert(!fetch.thread.isAlive, "Token fetch thread did not finish"))
+  }
+
+  private def withIdentityLogLevel[A](level: String)(body: => A): A = {
+    val prop = AzureDevOpsCredentialsPlugin.AzureIdentityLogProperty
+    val original = Option(System.getProperty(prop))
+    System.setProperty(prop, level)
+    try body finally {
+      original match {
+        case Some(value) => System.setProperty(prop, value)
+        case None => System.clearProperty(prop)
+      }
+    }
+  }
+
+  private val failedTokenResponses = Seq(
+    (
+      "an exception",
+      () => Mono.error[AccessToken](new RuntimeException("simulated token failure")),
+      "failed to get access token. Did you forget to run `az login`?"
+    ),
+    (
+      "an empty response",
+      () => Mono.empty[AccessToken](),
+      "failed to get access token (getToken() returned null)"
+    )
+  )
 
   "getToken" should "return Some(token) when the credential resolves successfully" in {
     new TokenProbe(credentialReturning("ya29.fake-token")).fetch() shouldBe Some("ya29.fake-token")
   }
 
-  it should "return None when the credential resolves to empty (null AccessToken)" in {
-    new TokenProbe(fakeCredential(Mono.empty[AccessToken]())).fetch() shouldBe None
-  }
-
-  it should "return None when the credential throws" in {
-    val boom = fakeCredential(Mono.error[AccessToken](new RuntimeException("simulated az failure")))
-    new TokenProbe(boom).fetch() shouldBe None
+  failedTokenResponses.foreach { case (failureKind, response, warning) =>
+    it should s"return None after two attempts ending in $failureKind" in {
+      val log = new RecordingLogger()
+      var attempts = 0
+      val credential = fakeCredential {
+        attempts += 1
+        response()
+      }
+      new TokenProbe(credential, log).fetch() shouldBe None
+      attempts shouldBe 2
+      log.warnings shouldBe Seq(warning)
+    }
   }
 
   it should "cache the result across calls (newCredential invoked at most once)" in {
@@ -352,6 +424,11 @@ class CredentialsBuilderSpec extends AnyFlatSpec with Matchers with BeforeAndAft
     probe.fetch() shouldBe Some("call-1") // cached
     probe.fetch() shouldBe Some("call-1") // still cached
     calls shouldBe 1
+  }
+
+  it should "start a new token fetch for a later builder after success" in {
+    new TokenProbe(credentialReturning("first-account")).fetch() shouldBe Some("first-account")
+    new TokenProbe(credentialReturning("second-account")).fetch() shouldBe Some("second-account")
   }
 
   it should "cache the None result and not re-try on subsequent calls" in {
@@ -372,7 +449,7 @@ class CredentialsBuilderSpec extends AnyFlatSpec with Matchers with BeforeAndAft
     probe.fetch() shouldBe None
     probe.fetch() shouldBe None
     probe.fetch() shouldBe None
-    calls shouldBe 1
+    calls shouldBe 2
   }
 
   it should "restore the previous Azure-identity log level after token acquisition" in {
@@ -402,60 +479,177 @@ class CredentialsBuilderSpec extends AnyFlatSpec with Matchers with BeforeAndAft
     }
   }
 
-  it should "restore the Azure-identity log level when concurrent CredentialsBuilder instances acquire tokens" in {
-    // Regression guard for the save/set/restore race: without a JVM-wide
-    // counted-set, two builders could observe each other's "off" mutation and
-    // leave the property pinned to "off" after both threads finish.
-    //
-    // The pre-fix code synchronized only on the CredentialsBuilder instance,
-    // so concurrent instances' save/set/restore blocks could interleave.
-    // The race window is the time between save (read property as X) and
-    // restore (write property back to X). To actually exercise that window,
-    // (a) all 8 threads gate on a CountDownLatch so they enter the
-    // acquire/SDK/release path within nanoseconds of each other, and
-    // (b) the credential's Mono is delayed by 50ms so the per-thread
-    // critical section is long enough for the interleaving to happen.
-    // (`Mono.just(...)` would resolve in microseconds — shorter than the
-    // cost of starting the next Thread — and the threads would typically
-    // run sequentially, neutering the regression guard.)
-    //
-    // This is paired with the deterministic counted-set invariant test
-    // below ("keep ... pinned to 'off' across nested suppressions"). This
-    // 8-thread variant verifies the live integration path through
-    // getTokenImpl; the nested-suppression test verifies the counted-set
-    // helpers directly.
-    val prop = AzureDevOpsCredentialsPlugin.AzureIdentityLogProperty
-    val original = Option(System.getProperty(prop))
-    System.setProperty(prop, "initial")
-    try {
-      val barrier = new CountDownLatch(1)
-      val threads = (1 to 8).map { i =>
-        val t = new Thread(new Runnable {
-          def run(): Unit = {
-            val delayedCred = fakeCredential(
-              Mono.just(new AccessToken(s"tok-$i", OffsetDateTime.now().plusHours(1)))
-                .delayElement(Duration.ofMillis(50)))
-            barrier.await()
-            new TokenProbe(delayedCred).fetch()
+  it should "share one in-progress token fetch across CredentialsBuilder instances" in {
+    withIdentityLogLevel("initial") {
+      val prop = AzureDevOpsCredentialsPlugin.AzureIdentityLogProperty
+      val started = new CountDownLatch(1)
+      val release = new CountDownLatch(1)
+      val joined = new CountDownLatch(3)
+      val log = new RecordingLogger(joined)
+      val ownerCalls = new AtomicInteger(0)
+      val joinerCalls = new AtomicInteger(0)
+      val active = new AtomicInteger(0)
+      val maximumActive = new AtomicInteger(0)
+
+      def track(body: => Mono[AccessToken]): Mono[AccessToken] = {
+        val current = active.incrementAndGet()
+        maximumActive.updateAndGet(previous => math.max(previous, current))
+        try body finally active.decrementAndGet()
+      }
+
+      val owner = new TokenFetch(new TokenProbe(fakeCredential {
+        track {
+          ownerCalls.incrementAndGet()
+          started.countDown()
+          await(release, "the owner token gate")
+          System.getProperty(prop) shouldBe "off"
+          AzureDevOpsCredentialsPlugin.suppressionCountForTesting shouldBe 1
+          Mono.just(new AccessToken("owner-token", OffsetDateTime.now().plusHours(1)))
+        }
+      }, log))
+      val joiners = (1 to 3).map { i =>
+        new TokenFetch(new TokenProbe(fakeCredential {
+          track {
+            joinerCalls.incrementAndGet()
+            Mono.just(new AccessToken(s"joiner-$i", OffsetDateTime.now().plusHours(1)))
           }
-        })
-        t.start()
-        t
+        }, log))
       }
-      barrier.countDown()
-      threads.foreach(_.join())
+      val fetches = owner +: joiners
+      try {
+        owner.thread.start()
+        await(started, "the owner's token request")
+        joiners.foreach(_.thread.start())
+        await(joined, "all builders to join the shared fetch")
+      } finally {
+        release.countDown()
+        joinFetches(fetches)
+      }
+
+      fetches.map(_.value) shouldBe Seq.fill(4)(Some("owner-token"))
+      ownerCalls.get() shouldBe 1
+      joinerCalls.get() shouldBe 0
+      maximumActive.get() shouldBe 1
+      log.warnings shouldBe empty
       System.getProperty(prop) shouldBe "initial"
-    } finally {
-      original match {
-        case Some(v) => System.setProperty(prop, v)
-        case None => System.clearProperty(prop)
+    }
+  }
+
+  failedTokenResponses.foreach { case (failureKind, response, warning) =>
+    it should s"share the retry result with callers arriving during the retry after $failureKind" in {
+      withIdentityLogLevel("initial") {
+        val prop = AzureDevOpsCredentialsPlugin.AzureIdentityLogProperty
+        val secondStarted = new CountDownLatch(1)
+        val release = new CountDownLatch(1)
+        val joined = new CountDownLatch(1)
+        val log = new RecordingLogger(joined)
+        val attempts = new AtomicInteger(0)
+        val joinerCalls = new AtomicInteger(0)
+        val owner = new TokenFetch(new TokenProbe(fakeCredential {
+          val attempt = attempts.incrementAndGet()
+          System.getProperty(prop) shouldBe "off"
+          AzureDevOpsCredentialsPlugin.suppressionCountForTesting shouldBe 1
+          if (attempt == 1) {
+            response()
+          } else {
+            secondStarted.countDown()
+            await(release, "the retry token gate")
+            System.getProperty(prop) shouldBe "off"
+            AzureDevOpsCredentialsPlugin.suppressionCountForTesting shouldBe 1
+            Mono.just(new AccessToken("retry-token", OffsetDateTime.now().plusHours(1)))
+          }
+        }, log))
+        val joiner = new TokenFetch(new TokenProbe(fakeCredential {
+          joinerCalls.incrementAndGet()
+          Mono.just(new AccessToken("joiner-token", OffsetDateTime.now().plusHours(1)))
+        }, log))
+        val fetches = Seq(owner, joiner)
+        try {
+          owner.thread.start()
+          await(secondStarted, "the owner's second attempt")
+          joiner.thread.start()
+          await(joined, "the late builder to join the retry")
+        } finally {
+          release.countDown()
+          joinFetches(fetches)
+        }
+
+        fetches.map(_.value) shouldBe Seq.fill(2)(Some("retry-token"))
+        attempts.get() shouldBe 2
+        joinerCalls.get() shouldBe 0
+        log.warnings shouldBe empty
+        System.getProperty(prop) shouldBe "initial"
       }
+    }
+
+    it should s"share an exhausted failure ending in $failureKind and allow a later builder to recover" in {
+      withIdentityLogLevel("initial") {
+        val prop = AzureDevOpsCredentialsPlugin.AzureIdentityLogProperty
+        val secondStarted = new CountDownLatch(1)
+        val release = new CountDownLatch(1)
+        val joined = new CountDownLatch(1)
+        val log = new RecordingLogger(joined)
+        val attempts = new AtomicInteger(0)
+        val joinerCalls = new AtomicInteger(0)
+        val owner = new TokenFetch(new TokenProbe(fakeCredential {
+          val attempt = attempts.incrementAndGet()
+          System.getProperty(prop) shouldBe "off"
+          if (attempt == 2) {
+            secondStarted.countDown()
+            await(release, "the failing retry gate")
+            System.getProperty(prop) shouldBe "off"
+            AzureDevOpsCredentialsPlugin.suppressionCountForTesting shouldBe 1
+          }
+          response()
+        }, log))
+        val joiner = new TokenFetch(new TokenProbe(fakeCredential {
+          joinerCalls.incrementAndGet()
+          Mono.just(new AccessToken("unused-token", OffsetDateTime.now().plusHours(1)))
+        }, log))
+        val fetches = Seq(owner, joiner)
+        try {
+          owner.thread.start()
+          await(secondStarted, "the failing second attempt")
+          joiner.thread.start()
+          await(joined, "the builder to join the failing fetch")
+        } finally {
+          release.countDown()
+          joinFetches(fetches)
+        }
+
+        fetches.map(_.value) shouldBe Seq(None, None)
+        attempts.get() shouldBe 2
+        joinerCalls.get() shouldBe 0
+        log.warnings shouldBe Seq(warning)
+        System.getProperty(prop) shouldBe "initial"
+        new TokenProbe(credentialReturning("recovered-token")).fetch() shouldBe Some("recovered-token")
+      }
+    }
+  }
+
+  it should "release the shared fetch after an exceptional acquisition" in {
+    withIdentityLogLevel("initial") {
+      val failure = new LinkageError("simulated linkage failure")
+      var attempts = 0
+      val probe = new AzureDevOpsCredentialsPlugin.CredentialsBuilder(nullLog) {
+        override protected def newCredential(): TokenCredential = {
+          attempts += 1
+          throw failure
+        }
+        def fetch(): Option[String] = getToken()
+      }
+      intercept[LinkageError](probe.fetch()) should be theSameInstanceAs failure
+      attempts shouldBe 1
+      AzureDevOpsCredentialsPlugin.suppressionCountForTesting shouldBe 0
+      AzureDevOpsCredentialsPlugin.tokenFetchInProgressForTesting shouldBe false
+      System.getProperty(AzureDevOpsCredentialsPlugin.AzureIdentityLogProperty) shouldBe "initial"
+      new TokenProbe(credentialReturning("fresh-token")).fetch() shouldBe Some("fresh-token")
     }
   }
 
   it should "keep the Azure-identity log level pinned to 'off' across nested suppressions and only restore on the outermost release" in {
     // Directly exercises the counted-set helpers to assert the invariant the
-    // 8-thread concurrency test relies on: inner acquire/release does NOT
+    // shared-fetch test relies on: inner acquire/release does NOT
     // restore the property while an outer suppression is still in flight.
     val prop = AzureDevOpsCredentialsPlugin.AzureIdentityLogProperty
     val original = Option(System.getProperty(prop))

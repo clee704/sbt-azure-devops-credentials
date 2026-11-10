@@ -19,6 +19,10 @@ with those credentials and falls through to Entra token acquisition only if the
 probe returns `401` (i.e., the existing entry is stale). Valid entries are
 trusted as before — no extra round-trips on the happy path.
 
+## Token acquisition
+
+The plugin runs at most one token request at a time per sbt JVM. Projects that need a token while a request is running share its result. A failed acquisition is retried once immediately before the existing warning is logged, so an unsuccessful acquisition now takes about two credential-chain runs. Other sbt processes and manual `az` commands are not coordinated.
+
 ## Configuring credential validation
 
 The probe behavior is controlled by `dev.chungmin.azure.validateExistingCredentials`
